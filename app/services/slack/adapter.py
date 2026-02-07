@@ -16,6 +16,9 @@ from app.services.slack.socket_client import SlackSocketClient
 
 logger = logging.getLogger(__name__)
 
+# Slack's message limit is ~40k characters; use a conservative threshold.
+SLACK_MAX_MESSAGE_LENGTH = 39_000
+
 
 class SlackAdapter:
     """Service adapter for Slack using Socket Mode.
@@ -315,6 +318,12 @@ class SlackAdapter:
                 current = session_data.get("current_text", "")
                 tool_name = update.content
                 new_text = f"{current}\n⚙️ `{tool_name}`"
+                # Trim old lines from the top if too long
+                if len(new_text) > SLACK_MAX_MESSAGE_LENGTH:
+                    lines = new_text.split("\n")
+                    while len("\n".join(lines)) > SLACK_MAX_MESSAGE_LENGTH and len(lines) > 1:
+                        lines.pop(0)
+                    new_text = "_(earlier tool calls trimmed)_\n" + "\n".join(lines)
                 await self._api.update_message(channel, ts, new_text)
                 session_data["current_text"] = new_text
 
@@ -358,6 +367,13 @@ class SlackAdapter:
 
         # Use accumulated message if available, otherwise use provided message
         final_text = self._message_buffers.pop(session_id, "") or message
+
+        # Slack has a ~40k character limit; truncate if needed
+        if len(final_text) > SLACK_MAX_MESSAGE_LENGTH:
+            final_text = (
+                final_text[:SLACK_MAX_MESSAGE_LENGTH]
+                + "\n\n_(message truncated — too long for Slack)_"
+            )
 
         try:
             channel = session_data["channel"]
