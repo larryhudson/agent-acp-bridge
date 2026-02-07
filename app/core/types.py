@@ -13,7 +13,7 @@ class BridgeSessionRequest:
     external_session_id: str  # e.g., Linear agent session ID
     service_name: str  # e.g., "linear", "slack"
     prompt: str  # The user's message / issue context
-    cwd: str  # Working directory for the agent
+    descriptive_name: str = ""  # Used for branch naming (e.g. issue title)
     is_followup: bool = False  # Whether this continues an existing session
     service_metadata: dict[str, Any] | None = None  # Adapter-specific state to persist
 

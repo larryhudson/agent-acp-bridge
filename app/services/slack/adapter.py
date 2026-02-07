@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from app.config import settings
+from app.core.repo_provider import slugify
 from app.core.types import BridgeSessionRequest, BridgeUpdate
 from app.services.slack.api_client import SlackApiClient
 from app.services.slack.models import AppMentionEvent, EventEnvelope, MessageEvent
@@ -150,23 +151,11 @@ class SlackAdapter:
             )
             return
 
-        # Determine working directory from project mappings
-        cwd = settings.get_cwd_for_key(f"slack:{mention_event.channel}")
-        if not cwd:
-            # Fallback: first slack mapping
-            for key, path in settings.project_mappings.items():
-                if key.startswith("slack:"):
-                    cwd = path
-                    break
-            else:
-                cwd = "/data/projects"
-
         logger.info(
-            "New Slack session: %s (channel=%s, thread=%s, cwd=%s)",
+            "New Slack session: %s (channel=%s, thread=%s)",
             session_id,
             mention_event.channel,
             thread_ts,
-            cwd,
         )
 
         # Post initial "thinking" message
@@ -199,7 +188,7 @@ class SlackAdapter:
             external_session_id=session_id,
             service_name=self.service_name,
             prompt=prompt,
-            cwd=cwd,
+            descriptive_name=slugify(prompt[:60]),
             service_metadata=session_data,
         )
 

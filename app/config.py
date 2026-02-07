@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from pydantic_settings import BaseSettings
 
 
@@ -15,7 +13,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     acp_agent_command: str = "claude-code-acp"  # or "codex-acp"
     enabled_services: str = "linear"  # comma-separated: "linear" or "linear,slack"
-    project_mappings_json: str = "{}"  # JSON: {"linear:team_xxx": "/data/projects/my-app"}
+
+    # Shared repo config
+    github_repo: str = ""  # e.g. "owner/repo"
+    github_installation_id: int = 0  # GitHub App installation ID for non-webhook sessions
 
     # Linear
     linear_webhook_secret: str = ""
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
     # Slack
     slack_app_token: str = ""  # App-level token (xapp-...) for Socket Mode
     slack_bot_token: str = ""  # Bot token (xoxb-...) for Web API
+    slack_user_token: str = ""  # User token (xoxp-...) for search API
 
     # GitHub
     github_app_id: str = ""
@@ -40,17 +42,6 @@ class Settings(BaseSettings):
     @property
     def enabled_services_list(self) -> list[str]:
         return [s.strip() for s in self.enabled_services.split(",") if s.strip()]
-
-    @property
-    def project_mappings(self) -> dict[str, str]:
-        return json.loads(self.project_mappings_json)
-
-    def get_cwd_for_key(self, key: str) -> str | None:
-        """Look up the working directory for a service-specific key.
-
-        Keys follow the pattern 'service:identifier', e.g. 'linear:team_abc'.
-        """
-        return self.project_mappings.get(key)
 
 
 settings = Settings()

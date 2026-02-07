@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, Request, Response
 
 from app.config import settings
+from app.core.repo_provider import slugify
 from app.core.types import BridgeSessionRequest, BridgeUpdate
 from app.services.linear.api_client import LinearApiClient
 from app.services.linear.models import AgentSessionEventPayload, PlanStep
@@ -86,19 +87,21 @@ class LinearAdapter:
 
         session_id = payload.agent_session.id
 
-        # Determine working directory from project mappings
-        cwd = self._resolve_cwd(payload)
-
         # Build prompt from promptContext or fallback
         prompt = payload.prompt_context or ""
-        if not prompt and payload.agent_session.issue:
-            prompt = f"Issue: {payload.agent_session.issue.title or payload.agent_session.issue.identifier}"
+        issue_title = ""
+        if payload.agent_session.issue:
+            issue_title = (
+                payload.agent_session.issue.title or payload.agent_session.issue.identifier
+            )
+            if not prompt:
+                prompt = f"Issue: {issue_title}"
 
         request = BridgeSessionRequest(
             external_session_id=session_id,
             service_name=self.service_name,
             prompt=prompt,
-            cwd=cwd,
+            descriptive_name=slugify(issue_title) if issue_title else "linear-task",
         )
 
         # Move issue to started state if applicable
@@ -226,22 +229,6 @@ class LinearAdapter:
             )
         except Exception:
             logger.exception("Error sending error to Linear for %s", session_id)
-
-    def _resolve_cwd(self, payload: AgentSessionEventPayload) -> str:
-        """Resolve working directory from project mappings."""
-        if payload.agent_session and payload.agent_session.issue:
-            team_id = payload.agent_session.issue.team_id
-            if team_id:
-                cwd = settings.get_cwd_for_key(f"linear:{team_id}")
-                if cwd:
-                    return cwd
-
-        # Fallback: use the first linear mapping
-        for key, cwd in settings.project_mappings.items():
-            if key.startswith("linear:"):
-                return cwd
-
-        return "/data/projects"
 
     async def _maybe_start_issue(self, payload: AgentSessionEventPayload) -> None:
         """Move issue to first 'started' state if applicable."""

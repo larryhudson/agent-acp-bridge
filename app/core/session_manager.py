@@ -14,6 +14,7 @@ from typing import Any
 
 from app.acp.session import AcpSession
 from app.config import settings
+from app.core.repo_provider import RepoProvider
 from app.core.types import BridgeSessionRequest, BridgeUpdate, ServiceAdapter
 from app.core.update_router import UpdateRouter
 
@@ -31,6 +32,7 @@ class ActiveSession:
     update_router: UpdateRouter | None  # None when restored from persistence
     acp_session_id: str  # The actual ACP session ID for resumption
     cwd: str  # Working directory for this session
+    branch_name: str = ""  # Git branch for this session
     service_metadata: dict[str, Any] | None = None  # Adapter-specific state
 
     def to_dict(self) -> dict[str, Any]:
@@ -40,6 +42,7 @@ class ActiveSession:
             "service_name": self.service_name,
             "acp_session_id": self.acp_session_id,
             "cwd": self.cwd,
+            "branch_name": self.branch_name,
         }
         if self.service_metadata:
             data["service_metadata"] = self.service_metadata
@@ -56,6 +59,7 @@ class ActiveSession:
             update_router=None,  # Will be created when needed
             acp_session_id=data["acp_session_id"],
             cwd=data["cwd"],
+            branch_name=data.get("branch_name", ""),
             service_metadata=data.get("service_metadata"),
         )
 
@@ -63,7 +67,12 @@ class ActiveSession:
 class SessionManager:
     """Orchestrates bridge sessions between external services and ACP agents."""
 
-    def __init__(self, persistence_file: Path = Path("/var/lib/bridge/sessions.json")) -> None:
+    def __init__(
+        self,
+        repo_provider: RepoProvider,
+        persistence_file: Path = Path("/var/lib/bridge/sessions.json"),
+    ) -> None:
+        self._repo_provider = repo_provider
         self._active_sessions: dict[str, ActiveSession] = {}
         self._persistence_file = persistence_file
         self._persisted_metadata: dict[str, Any] = {}
@@ -125,30 +134,17 @@ class SessionManager:
         except Exception:
             logger.exception("Failed to persist sessions to %s", self._persistence_file)
 
-    @staticmethod
-    def _build_agent_env() -> dict[str, str] | None:
-        """Build extra environment variables for the agent subprocess.
-
-        Ensures API keys from the .env file are forwarded to the agent process,
-        since pydantic-settings doesn't export them to os.environ.
-        """
-        env: dict[str, str] = {}
-        if settings.anthropic_api_key:
-            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
-        if settings.openai_api_key:
-            env["OPENAI_API_KEY"] = settings.openai_api_key
-        return env or None
-
     async def handle_new_session(
         self, adapter: ServiceAdapter, request: BridgeSessionRequest
     ) -> None:
         """Handle a new session request from a service adapter.
 
         1. Sends an immediate "thinking" update
-        2. Spawns an ACP session
-        3. Wires up the update router
-        4. Sends the prompt
-        5. On completion, calls adapter.send_completion()
+        2. Prepares the repo (clone/fetch, create branch, install skills)
+        3. Spawns an ACP session
+        4. Wires up the update router
+        5. Sends the prompt
+        6. On completion, calls adapter.send_completion()
         """
         external_id = request.external_session_id
 
@@ -158,6 +154,14 @@ class SessionManager:
             BridgeUpdate(type="thought", content="Starting work..."),
         )
 
+        # Prepare the repo: clone/fetch, create branch, install skill files
+        try:
+            repo_session = await self._repo_provider.prepare_new_session(request.descriptive_name)
+        except Exception:
+            logger.exception("Failed to prepare repo for %s", external_id)
+            await adapter.send_error(external_id, "Failed to prepare repository")
+            return
+
         # Create update router for this session
         router = UpdateRouter(adapter, external_id)
 
@@ -165,11 +169,11 @@ class SessionManager:
         acp_session = AcpSession(
             command=settings.acp_agent_command,
             on_update=router.handle_update,
-            env=self._build_agent_env(),
+            env=repo_session.env or None,
         )
 
         try:
-            acp_session_id = await acp_session.start(cwd=request.cwd)
+            acp_session_id = await acp_session.start(cwd=repo_session.cwd)
         except Exception:
             logger.exception("Failed to start ACP session for %s", external_id)
             await adapter.send_error(external_id, "Failed to start agent session")
@@ -183,15 +187,31 @@ class SessionManager:
             acp_session=acp_session,
             update_router=router,
             acp_session_id=acp_session_id,
-            cwd=request.cwd,
+            cwd=repo_session.cwd,
+            branch_name=repo_session.branch_name,
             service_metadata=request.service_metadata,
         )
         self._active_sessions[external_id] = active
         self._save_sessions()  # Persist to disk
 
+        # Append git/PR instructions when working on a branch
+        prompt = request.prompt
+        if repo_session.branch_name:
+            prompt += (
+                "\n\n---\n"
+                f"You are working on a git branch: `{repo_session.branch_name}`. "
+                "This branch has been automatically created with the latest changes "
+                "from the main branch.\n"
+                "If the user is asking you to make code changes, commit your changes, "
+                "push the branch, and create a GitHub pull request using the `gh` CLI. "
+                "The `GH_TOKEN` env var is already set.\n"
+                "If the user is just asking questions or requesting information, "
+                "do not make any changes or create a PR."
+            )
+
         # Send the prompt and wait for completion
         try:
-            stop_reason = await acp_session.prompt(request.prompt)
+            stop_reason = await acp_session.prompt(prompt)
             # Flush any remaining buffered updates
             await router.flush()
 
@@ -230,12 +250,34 @@ class SessionManager:
             BridgeUpdate(type="thought", content="Processing follow-up..."),
         )
 
+        # Prepare the repo for resumption (fetch, checkout branch, refresh tokens)
+        env: dict[str, str] | None = None
+        if active.branch_name:
+            try:
+                repo_session = await self._repo_provider.prepare_resume_session(active.branch_name)
+                env = repo_session.env or None
+            except Exception:
+                logger.exception("Failed to prepare repo for follow-up %s", external_session_id)
+                # Fall back to just refreshing tokens
+                try:
+                    fresh_env = await self._repo_provider.build_agent_env()
+                    env = fresh_env or None
+                except Exception:
+                    logger.exception("Failed to build agent env for %s", external_session_id)
+        else:
+            # No branch (legacy session) — just refresh tokens
+            try:
+                fresh_env = await self._repo_provider.build_agent_env()
+                env = fresh_env or None
+            except Exception:
+                logger.exception("Failed to build agent env for %s", external_session_id)
+
         # Create a new ACP subprocess and RESUME the session with full history
         router = UpdateRouter(adapter, external_session_id)
         acp_session = AcpSession(
             command=settings.acp_agent_command,
             on_update=router.handle_update,
-            env=self._build_agent_env(),
+            env=env,
         )
 
         try:
@@ -307,6 +349,7 @@ class SessionManager:
                     update_router=None,  # Will be created on follow-up
                     acp_session_id=metadata["acp_session_id"],
                     cwd=metadata["cwd"],
+                    branch_name=metadata.get("branch_name", ""),
                     service_metadata=metadata.get(
                         "service_metadata"
                     ),  # Restore adapter-specific state
@@ -345,15 +388,3 @@ class SessionManager:
                 logger.exception("Error stopping session %s", active.external_session_id)
         # Don't clear sessions or save empty state — keep persisted data for restart
         self._active_sessions.clear()
-
-    def _get_cwd_for_session(self, active: ActiveSession) -> str:
-        """Resolve the working directory for a session.
-
-        Falls back to looking up project mappings by service name.
-        """
-        # Try all project mappings for this service
-        for key, cwd in settings.project_mappings.items():
-            if key.startswith(f"{active.service_name}:"):
-                return cwd
-        # Fallback
-        return "/data/projects"

@@ -9,8 +9,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.config import settings
+from app.core.repo_provider import RepoProvider
 from app.core.session_manager import SessionManager
 from app.core.types import ServiceAdapter
+from app.services.github.auth import GitHubAuth
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +21,10 @@ _session_manager: SessionManager | None = None
 _adapters: list[ServiceAdapter] = []
 
 
-def _create_adapters(session_manager: SessionManager) -> list[ServiceAdapter]:
+def _create_adapters(
+    session_manager: SessionManager,
+    github_auth: GitHubAuth | None = None,
+) -> list[ServiceAdapter]:
     """Instantiate adapters for all enabled services."""
     adapters: list[ServiceAdapter] = []
 
@@ -35,7 +40,7 @@ def _create_adapters(session_manager: SessionManager) -> list[ServiceAdapter]:
         elif service == "github":
             from app.services.github.adapter import GitHubAdapter
 
-            adapters.append(GitHubAdapter(session_manager))
+            adapters.append(GitHubAdapter(session_manager, auth=github_auth))
         else:
             logger.warning("Unknown service: %s (skipping)", service)
 
@@ -52,8 +57,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    _session_manager = SessionManager()
-    _adapters = _create_adapters(_session_manager)
+    # Create shared GitHub auth if a repo is configured
+    github_auth: GitHubAuth | None = None
+    if settings.github_repo and settings.github_app_id:
+        github_auth = GitHubAuth()
+
+    # Create shared RepoProvider
+    repo_provider = RepoProvider(
+        auth=github_auth,
+        enabled_services=settings.enabled_services_list,
+    )
+
+    _session_manager = SessionManager(repo_provider=repo_provider)
+    _adapters = _create_adapters(_session_manager, github_auth=github_auth)
 
     # Register routes and start each adapter
     for adapter in _adapters:
@@ -77,6 +93,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     for adapter in _adapters:
         await adapter.close()
+
+    if github_auth is not None:
+        await github_auth.close()
 
     _session_manager = None
     _adapters = []

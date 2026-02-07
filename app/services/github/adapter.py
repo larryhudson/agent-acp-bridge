@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import asyncio.subprocess
 import logging
 import re
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
 
 from app.config import settings
+from app.core.repo_provider import slugify
 from app.core.types import BridgeSessionRequest, BridgeUpdate
 from app.services.github.api_client import GitHubApiClient
 from app.services.github.auth import GitHubAuth
@@ -37,9 +36,9 @@ class GitHubAdapter:
 
     service_name: str = "github"
 
-    def __init__(self, session_manager: Any) -> None:
+    def __init__(self, session_manager: Any, auth: GitHubAuth | None = None) -> None:
         self._session_manager = session_manager
-        self._auth = GitHubAuth()
+        self._auth = auth or GitHubAuth()
         self._api = GitHubApiClient(self._auth)
         self._bot_login: str | None = settings.github_bot_login or None
         # Track session data: {session_id: {owner, repo, issue_number, ...}}
@@ -235,14 +234,11 @@ class GitHubAdapter:
         # Mark this issue as active (persists after session ends)
         self._active_issues.add(session_id)
 
-        # Ensure repo is cloned and up to date
-        cwd = await self._ensure_repo(repo.full_name, installation_id)
-
         request = BridgeSessionRequest(
             external_session_id=session_id,
             service_name=self.service_name,
             prompt=full_prompt,
-            cwd=cwd,
+            descriptive_name=slugify(issue.title),
             service_metadata=session_data,
         )
 
@@ -335,14 +331,11 @@ class GitHubAdapter:
         # Mark this issue as active (persists after session ends)
         self._active_issues.add(session_id)
 
-        # Ensure repo is cloned and up to date
-        cwd = await self._ensure_repo(repo.full_name, installation_id)
-
         request = BridgeSessionRequest(
             external_session_id=session_id,
             service_name=self.service_name,
             prompt=full_prompt,
-            cwd=cwd,
+            descriptive_name=slugify(issue.title),
             service_metadata=session_data,
         )
 
@@ -447,14 +440,11 @@ class GitHubAdapter:
         # Mark this PR as active (persists after session ends)
         self._active_issues.add(session_id)
 
-        # Ensure repo is cloned and up to date
-        cwd = await self._ensure_repo(repo.full_name, installation_id)
-
         request = BridgeSessionRequest(
             external_session_id=session_id,
             service_name=self.service_name,
             prompt=full_prompt,
-            cwd=cwd,
+            descriptive_name=slugify(pr.title),
             service_metadata=session_data,
         )
 
@@ -620,88 +610,6 @@ class GitHubAdapter:
             await self._api.update_review_comment(owner, repo, comment_id, body, installation_id)
         else:
             await self._api.update_comment(owner, repo, comment_id, body, installation_id)
-
-    async def _ensure_repo(self, full_name: str, installation_id: int) -> str:
-        """Ensure the repository is cloned locally, fetching latest if it already exists.
-
-        Returns the path to the local clone.
-        """
-        # Check project_mappings first (manual override)
-        configured = settings.get_cwd_for_key(f"github:{full_name}")
-        if configured:
-            return configured
-
-        repo_path = Path("/data/projects") / full_name
-
-        if repo_path.exists():
-            # Fetch latest
-            logger.info("Fetching latest for %s", full_name)
-            token = await self._auth.get_installation_token(installation_id)
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "remote",
-                "set-url",
-                "origin",
-                f"https://x-access-token:{token}@github.com/{full_name}.git",
-                cwd=str(repo_path),
-            )
-            await proc.wait()
-
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "fetch",
-                "origin",
-                cwd=str(repo_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.wait()
-
-            # Reset to the default branch
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "rev-parse",
-                "--abbrev-ref",
-                "origin/HEAD",
-                cwd=str(repo_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            if proc.returncode == 0:
-                remote_head = stdout.decode().strip()  # e.g. "origin/main"
-                proc = await asyncio.create_subprocess_exec(
-                    "git",
-                    "reset",
-                    "--hard",
-                    remote_head,
-                    cwd=str(repo_path),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await proc.wait()
-
-            return str(repo_path)
-
-        # Clone the repo
-        logger.info("Cloning %s into %s", full_name, repo_path)
-        repo_path.parent.mkdir(parents=True, exist_ok=True)
-        token = await self._auth.get_installation_token(installation_id)
-
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            f"https://x-access-token:{token}@github.com/{full_name}.git",
-            str(repo_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"git clone failed: {stderr.decode()}")
-
-        logger.info("Cloned %s successfully", full_name)
-        return str(repo_path)
 
     async def close(self) -> None:
         """Clean up resources."""
