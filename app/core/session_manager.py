@@ -1,0 +1,359 @@
+"""SessionManager — orchestrates the lifecycle of bridge sessions.
+
+Maps external service sessions to ACP sessions, handles new sessions,
+follow-ups, cancellations, and cleanup.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from app.acp.session import AcpSession
+from app.config import settings
+from app.core.types import BridgeSessionRequest, BridgeUpdate, ServiceAdapter
+from app.core.update_router import UpdateRouter
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ActiveSession:
+    """Tracks an active bridge session."""
+
+    external_session_id: str
+    service_name: str
+    adapter: ServiceAdapter
+    acp_session: AcpSession | None  # None when restored from persistence
+    update_router: UpdateRouter | None  # None when restored from persistence
+    acp_session_id: str  # The actual ACP session ID for resumption
+    cwd: str  # Working directory for this session
+    service_metadata: dict[str, Any] | None = None  # Adapter-specific state
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize session metadata to dict (excluding runtime objects)."""
+        data: dict[str, Any] = {
+            "external_session_id": self.external_session_id,
+            "service_name": self.service_name,
+            "acp_session_id": self.acp_session_id,
+            "cwd": self.cwd,
+        }
+        if self.service_metadata:
+            data["service_metadata"] = self.service_metadata
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], adapter: ServiceAdapter) -> ActiveSession:
+        """Restore session from persisted metadata (without active ACP session)."""
+        return cls(
+            external_session_id=data["external_session_id"],
+            service_name=data["service_name"],
+            adapter=adapter,
+            acp_session=None,  # Will be created when needed
+            update_router=None,  # Will be created when needed
+            acp_session_id=data["acp_session_id"],
+            cwd=data["cwd"],
+            service_metadata=data.get("service_metadata"),
+        )
+
+
+class SessionManager:
+    """Orchestrates bridge sessions between external services and ACP agents."""
+
+    def __init__(self, persistence_file: Path = Path("/var/lib/bridge/sessions.json")) -> None:
+        self._active_sessions: dict[str, ActiveSession] = {}
+        self._persistence_file = persistence_file
+        self._persisted_metadata: dict[str, Any] = {}
+        self._load_sessions()
+
+    def _load_sessions(self) -> None:
+        """Load persisted session metadata from disk.
+
+        Note: This only restores the metadata. Active ACP sessions and adapters
+        are not restored - they will be recreated on first follow-up.
+        """
+        if not self._persistence_file.exists():
+            logger.info("No persisted sessions file found at %s", self._persistence_file)
+            return
+
+        try:
+            with open(self._persistence_file) as f:
+                data = json.load(f)
+
+            # We can't fully restore sessions without adapters, so just log what we found
+            session_count = len(data.get("sessions", {}))
+            if session_count > 0:
+                logger.info(
+                    "Found %d persisted session(s) in %s. Sessions will be available "
+                    "for resumption when services reconnect.",
+                    session_count,
+                    self._persistence_file,
+                )
+                # Store the raw data for later use when adapters reconnect
+                self._persisted_metadata = data.get("sessions", {})
+            else:
+                self._persisted_metadata = {}
+        except Exception:
+            logger.exception("Failed to load persisted sessions from %s", self._persistence_file)
+            self._persisted_metadata = {}
+
+    def _save_sessions(self) -> None:
+        """Persist current session metadata to disk."""
+        try:
+            # Ensure parent directory exists
+            self._persistence_file.parent.mkdir(parents=True, exist_ok=True)
+
+            sessions_data = {
+                external_id: session.to_dict()
+                for external_id, session in self._active_sessions.items()
+            }
+
+            data = {"sessions": sessions_data}
+
+            # Write atomically using a temp file
+            temp_file = self._persistence_file.with_suffix(".tmp")
+            with open(temp_file, "w") as f:
+                json.dump(data, f, indent=2)
+            temp_file.replace(self._persistence_file)
+
+            logger.debug(
+                "Persisted %d session(s) to %s", len(sessions_data), self._persistence_file
+            )
+        except Exception:
+            logger.exception("Failed to persist sessions to %s", self._persistence_file)
+
+    @staticmethod
+    def _build_agent_env() -> dict[str, str] | None:
+        """Build extra environment variables for the agent subprocess.
+
+        Ensures API keys from the .env file are forwarded to the agent process,
+        since pydantic-settings doesn't export them to os.environ.
+        """
+        env: dict[str, str] = {}
+        if settings.anthropic_api_key:
+            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+        if settings.openai_api_key:
+            env["OPENAI_API_KEY"] = settings.openai_api_key
+        return env or None
+
+    async def handle_new_session(
+        self, adapter: ServiceAdapter, request: BridgeSessionRequest
+    ) -> None:
+        """Handle a new session request from a service adapter.
+
+        1. Sends an immediate "thinking" update
+        2. Spawns an ACP session
+        3. Wires up the update router
+        4. Sends the prompt
+        5. On completion, calls adapter.send_completion()
+        """
+        external_id = request.external_session_id
+
+        # Send immediate acknowledgment
+        await adapter.send_update(
+            external_id,
+            BridgeUpdate(type="thought", content="Starting work..."),
+        )
+
+        # Create update router for this session
+        router = UpdateRouter(adapter, external_id)
+
+        # Spawn ACP session
+        acp_session = AcpSession(
+            command=settings.acp_agent_command,
+            on_update=router.handle_update,
+            env=self._build_agent_env(),
+        )
+
+        try:
+            acp_session_id = await acp_session.start(cwd=request.cwd)
+        except Exception:
+            logger.exception("Failed to start ACP session for %s", external_id)
+            await adapter.send_error(external_id, "Failed to start agent session")
+            return
+
+        # Track the session
+        active = ActiveSession(
+            external_session_id=external_id,
+            service_name=request.service_name,
+            adapter=adapter,
+            acp_session=acp_session,
+            update_router=router,
+            acp_session_id=acp_session_id,
+            cwd=request.cwd,
+            service_metadata=request.service_metadata,
+        )
+        self._active_sessions[external_id] = active
+        self._save_sessions()  # Persist to disk
+
+        # Send the prompt and wait for completion
+        try:
+            stop_reason = await acp_session.prompt(request.prompt)
+            # Flush any remaining buffered updates
+            await router.flush()
+
+            if stop_reason == "end_turn":
+                await adapter.send_completion(external_id, "Work completed")
+            elif stop_reason == "cancelled":
+                await adapter.send_completion(external_id, "Work was cancelled")
+            else:
+                await adapter.send_completion(external_id, f"Agent stopped (reason: {stop_reason})")
+        except Exception:
+            logger.exception("Error during ACP prompt for %s", external_id)
+            await adapter.send_error(external_id, "Agent encountered an error during execution")
+        finally:
+            # Stop the subprocess but KEEP the ActiveSession record
+            # This allows follow-ups to resume with the same acp_session_id
+            await acp_session.stop()
+            logger.info(
+                "Stopped ACP subprocess for %s (session record kept for resumption)", external_id
+            )
+
+    async def handle_followup(self, external_session_id: str, prompt: str) -> None:
+        """Handle a follow-up message on an existing session.
+
+        Resumes the ACP session with full conversation history.
+        """
+        active = self._active_sessions.get(external_session_id)
+        if active is None:
+            logger.warning("No active session for follow-up: %s", external_session_id)
+            return
+
+        adapter = active.adapter
+
+        # Send immediate acknowledgment
+        await adapter.send_update(
+            external_session_id,
+            BridgeUpdate(type="thought", content="Processing follow-up..."),
+        )
+
+        # Create a new ACP subprocess and RESUME the session with full history
+        router = UpdateRouter(adapter, external_session_id)
+        acp_session = AcpSession(
+            command=settings.acp_agent_command,
+            on_update=router.handle_update,
+            env=self._build_agent_env(),
+        )
+
+        try:
+            # Resume the existing session (loads conversation history from disk)
+            await acp_session.start(cwd=active.cwd, resume_session_id=active.acp_session_id)
+            logger.info(
+                "Resumed ACP session %s for follow-up (external: %s)",
+                active.acp_session_id,
+                external_session_id,
+            )
+        except Exception:
+            logger.exception("Failed to resume ACP session for %s", external_session_id)
+            await adapter.send_error(external_session_id, "Failed to resume session")
+            return
+
+        # Update the active session with new subprocess
+        active.acp_session = acp_session
+        active.update_router = router
+
+        try:
+            stop_reason = await acp_session.prompt(prompt)
+            await router.flush()
+
+            if stop_reason == "end_turn":
+                await adapter.send_completion(external_session_id, "Follow-up completed")
+            else:
+                await adapter.send_completion(
+                    external_session_id, f"Agent stopped (reason: {stop_reason})"
+                )
+        except Exception:
+            logger.exception("Error during follow-up prompt for %s", external_session_id)
+            await adapter.send_error(
+                external_session_id, "Agent encountered an error during follow-up"
+            )
+        finally:
+            await acp_session.stop()
+
+    async def handle_cancel(self, external_session_id: str) -> None:
+        """Cancel an active session."""
+        active = self._active_sessions.get(external_session_id)
+        if active is None or active.acp_session is None:
+            return
+
+        await active.acp_session.cancel()
+
+    def restore_sessions_for_adapter(self, adapter: ServiceAdapter) -> None:
+        """Restore persisted sessions for a given adapter.
+
+        This is called when an adapter starts up after a container restart.
+        It recreates ActiveSession records from persisted metadata, allowing
+        follow-ups to resume with full conversation history.
+        """
+        if not self._persisted_metadata:
+            return
+
+        restored_count = 0
+        for external_id, metadata in self._persisted_metadata.items():
+            if metadata["service_name"] == adapter.service_name:
+                # Skip if already active (shouldn't happen, but be defensive)
+                if external_id in self._active_sessions:
+                    continue
+
+                # Create a partial ActiveSession that can be resumed on follow-up
+                self._active_sessions[external_id] = ActiveSession(
+                    external_session_id=metadata["external_session_id"],
+                    service_name=metadata["service_name"],
+                    adapter=adapter,
+                    acp_session=None,  # Will be created on follow-up
+                    update_router=None,  # Will be created on follow-up
+                    acp_session_id=metadata["acp_session_id"],
+                    cwd=metadata["cwd"],
+                    service_metadata=metadata.get(
+                        "service_metadata"
+                    ),  # Restore adapter-specific state
+                )
+                restored_count += 1
+
+        if restored_count > 0:
+            logger.info(
+                "Restored %d persisted session(s) for adapter %s",
+                restored_count,
+                adapter.service_name,
+            )
+
+    def get_sessions_for_service(self, service_name: str) -> dict[str, ActiveSession]:
+        """Get all active sessions for a given service name."""
+        return {
+            ext_id: session
+            for ext_id, session in self._active_sessions.items()
+            if session.service_name == service_name
+        }
+
+    def remove_session(self, external_session_id: str) -> None:
+        """Remove a session from tracking and persist the change."""
+        if external_session_id in self._active_sessions:
+            del self._active_sessions[external_session_id]
+            self._save_sessions()
+            logger.info("Removed session %s from tracking", external_session_id)
+
+    async def shutdown(self) -> None:
+        """Stop all active ACP subprocesses but keep sessions persisted for restart."""
+        for active in self._active_sessions.values():
+            try:
+                if active.acp_session is not None:
+                    await active.acp_session.stop()
+            except Exception:
+                logger.exception("Error stopping session %s", active.external_session_id)
+        # Don't clear sessions or save empty state — keep persisted data for restart
+        self._active_sessions.clear()
+
+    def _get_cwd_for_session(self, active: ActiveSession) -> str:
+        """Resolve the working directory for a session.
+
+        Falls back to looking up project mappings by service name.
+        """
+        # Try all project mappings for this service
+        for key, cwd in settings.project_mappings.items():
+            if key.startswith(f"{active.service_name}:"):
+                return cwd
+        # Fallback
+        return "/data/projects"

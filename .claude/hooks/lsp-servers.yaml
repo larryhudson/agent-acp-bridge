@@ -1,0 +1,28 @@
+---
+# LSP Server Configuration for Claude Code Hooks
+#
+# Each entry defines a language server the LSP bridge will
+# attempt to start. Servers only start if requirements are met.
+#
+# Fields:
+#   command    - Command name or path to LSP binary
+#   args       - Arguments to pass (list)
+#   search     - Paths to try before $PATH (project-relative)
+#   cwd        - Working directory (project-relative)
+#   root       - Workspace root for LSP (project-relative)
+#   env        - Extra env vars (${PROJECT_DIR}, ${PATH})
+#   requires   - Files that must exist (project-relative)
+#   extensions - File extension to LSP language ID map
+
+servers:
+
+  ruff:
+    command: ruff
+    args: ["server"]
+    search:
+      - .venv/bin/ruff
+    requires:
+      - pyproject.toml
+    extensions:
+      .py: python
+      .pyi: python

@@ -1,0 +1,414 @@
+"""SlackAdapter — implements ServiceAdapter for Slack's Socket Mode."""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from fastapi import FastAPI
+
+from app.config import settings
+from app.core.types import BridgeSessionRequest, BridgeUpdate
+from app.services.slack.api_client import SlackApiClient
+from app.services.slack.models import AppMentionEvent, EventEnvelope, MessageEvent
+from app.services.slack.socket_client import SlackSocketClient
+
+logger = logging.getLogger(__name__)
+
+
+class SlackAdapter:
+    """Service adapter for Slack using Socket Mode.
+
+    Handles:
+    - WebSocket connection management
+    - Event routing (app_mention, message)
+    - Translating BridgeUpdates to Slack message edits
+    - Session lifecycle management
+    """
+
+    service_name: str = "slack"
+
+    def __init__(self, session_manager: Any) -> None:
+        self._session_manager = session_manager
+        self._api = SlackApiClient(settings.slack_bot_token)
+        self._socket_client = SlackSocketClient(
+            app_token=settings.slack_app_token,
+            bot_token=settings.slack_bot_token,
+            on_event=self._handle_event,
+        )
+        # Track session data: {session_id: {channel, thread_ts, progress_message_ts, ...}}
+        self._sessions: dict[str, dict[str, Any]] = {}
+        # Accumulate message chunks for final response
+        self._message_buffers: dict[str, str] = {}
+        # Track threads where bot has been mentioned (persists after session completion)
+        # Format: {(channel, thread_ts)}
+        self._active_threads: set[tuple[str, str]] = set()
+
+    def register_routes(self, app: FastAPI) -> None:
+        """No routes needed for Socket Mode (implements ServiceAdapter.register_routes)."""
+        pass
+
+    async def start(self) -> None:
+        """Start the Socket Mode client (implements ServiceAdapter.start)."""
+        self._socket_client.start()
+        logger.info("Slack Socket Mode client started")
+
+    def restore_persisted_sessions(self) -> None:
+        """Rebuild adapter state from sessions restored by the session manager."""
+        restored = self._session_manager.get_sessions_for_service(self.service_name)
+        for session_id, active in restored.items():
+            if active.service_metadata:
+                self._sessions[session_id] = active.service_metadata
+                channel = active.service_metadata.get("channel")
+                thread_ts = active.service_metadata.get("thread_ts")
+                if channel and thread_ts:
+                    self._active_threads.add((channel, thread_ts))
+                logger.debug(
+                    "Restored session %s with metadata: %s", session_id, active.service_metadata
+                )
+        if restored:
+            logger.info("Restored %d Slack session(s) from persistence", len(restored))
+            logger.info("Active sessions after restore: %s", list(self._sessions.keys()))
+
+    async def on_session_created(self, event: Any) -> BridgeSessionRequest:
+        """Not used — events handled via Socket Mode (implements ServiceAdapter.on_session_created)."""
+        raise NotImplementedError("Socket Mode adapters handle events via WebSocket callbacks")
+
+    async def _handle_event(self, envelope: EventEnvelope) -> None:
+        """Handle an event from Socket Mode.
+
+        Args:
+            envelope: Event envelope from WebSocket
+        """
+        if envelope.type != "events_api":
+            return
+
+        event_data = envelope.payload.get("event", {})
+        event_type = event_data.get("type")
+
+        # DEBUG: Log raw event payload
+        logger.info("Raw Slack event: type=%s, envelope_id=%s", event_type, envelope.envelope_id)
+        logger.debug("Full event payload: %s", event_data)
+
+        try:
+            if event_type == "app_mention":
+                await self._handle_app_mention(event_data)
+            elif event_type == "message":
+                await self._handle_message(event_data)
+            else:
+                logger.debug("Ignoring event type: %s", event_type)
+        except Exception:
+            logger.exception("Error handling event type %s", event_type)
+
+    async def _handle_app_mention(self, event: dict[str, Any]) -> None:
+        """Handle app_mention event (new session).
+
+        Args:
+            event: App mention event data
+        """
+        # DEBUG: Log the mention event
+        logger.info(
+            "app_mention event received: user=%s, text=%s",
+            event.get("user"),
+            event.get("text", "")[:100],
+        )
+
+        try:
+            mention_event = AppMentionEvent.model_validate(event)
+        except Exception:
+            logger.exception("Failed to parse app_mention event: %s", event)
+            return
+
+        # Create session ID from channel and thread
+        thread_ts = mention_event.thread_ts or mention_event.ts
+        session_id = f"slack:{mention_event.channel}:{thread_ts}"
+
+        # DEBUG: Log what sessions we have
+        logger.info(
+            "Checking for existing session %s. Current sessions: %s",
+            session_id,
+            list(self._sessions.keys()),
+        )
+
+        # Check if session already exists (avoid duplicates)
+        if session_id in self._sessions:
+            logger.info("Session %s already exists, ignoring duplicate mention", session_id)
+            return
+
+        # Extract prompt (strip bot mention)
+        prompt = re.sub(r"<@\w+>\s*", "", mention_event.text).strip()
+        if not prompt:
+            # Empty prompt, just acknowledge
+            await self._api.post_message(
+                channel=mention_event.channel,
+                text="Hi! Please include a message when you @mention me.",
+                thread_ts=thread_ts,
+            )
+            return
+
+        # Determine working directory from project mappings
+        cwd = settings.get_cwd_for_key(f"slack:{mention_event.channel}")
+        if not cwd:
+            # Fallback: first slack mapping
+            for key, path in settings.project_mappings.items():
+                if key.startswith("slack:"):
+                    cwd = path
+                    break
+            else:
+                cwd = "/data/projects"
+
+        logger.info(
+            "New Slack session: %s (channel=%s, thread=%s, cwd=%s)",
+            session_id,
+            mention_event.channel,
+            thread_ts,
+            cwd,
+        )
+
+        # Post initial "thinking" message
+        try:
+            response = await self._api.post_message(
+                channel=mention_event.channel,
+                text="🤔 Thinking...",
+                thread_ts=thread_ts,
+            )
+            progress_ts = response["ts"]
+        except Exception:
+            logger.exception("Failed to post initial message")
+            return
+
+        # Track session
+        session_data = {
+            "channel": mention_event.channel,
+            "thread_ts": thread_ts,
+            "original_ts": mention_event.ts,
+            "progress_message_ts": progress_ts,
+            "current_text": "🤔 Thinking...",
+        }
+        self._sessions[session_id] = session_data
+
+        # Mark this thread as active (will persist after session ends)
+        self._active_threads.add((mention_event.channel, thread_ts))
+
+        # Create bridge request
+        request = BridgeSessionRequest(
+            external_session_id=session_id,
+            service_name=self.service_name,
+            prompt=prompt,
+            cwd=cwd,
+            service_metadata=session_data,
+        )
+
+        # Start agent session
+        await self._session_manager.handle_new_session(self, request)
+
+    async def _handle_message(self, event: dict[str, Any]) -> None:
+        """Handle message event (follow-up in thread).
+
+        Args:
+            event: Message event data
+        """
+        # DEBUG: Log message event details
+        logger.info(
+            "message event: subtype=%s, user=%s, bot_id=%s, text=%s",
+            event.get("subtype"),
+            event.get("user"),
+            event.get("bot_id"),
+            event.get("text", "")[:100],
+        )
+
+        try:
+            message_event = MessageEvent.model_validate(event)
+        except Exception:
+            logger.exception("Failed to parse message event: %s", event)
+            return
+
+        # Ignore bot messages (including our own!)
+        # Check for bot_id (our bot posts) or bot_profile (Slack's format)
+        if (
+            message_event.subtype == "bot_message"
+            or not message_event.user
+            or event.get("bot_id")
+            or event.get("bot_profile")
+        ):
+            logger.debug("Ignoring bot message")
+            return
+
+        # Only handle messages in threads
+        thread_ts = message_event.thread_ts
+        if not thread_ts:
+            return
+
+        # Check if this thread is one where the bot has been mentioned
+        thread_key = (message_event.channel, thread_ts)
+        if thread_key not in self._active_threads:
+            logger.debug("Thread %s not active, ignoring message", thread_key)
+            return
+
+        session_id = f"slack:{message_event.channel}:{thread_ts}"
+
+        # Get the prompt text
+        prompt = (message_event.text or "").strip()
+        if not prompt:
+            return
+
+        logger.info("Thread message for %s: %s", session_id, prompt[:100])
+
+        # Always create a NEW progress message for follow-ups
+        # (Even if we have session data, we want a fresh message, not to edit the old one)
+        logger.info("Creating new progress message for follow-up in thread %s", session_id)
+        try:
+            response = await self._api.post_message(
+                channel=message_event.channel,
+                text="🤔 Thinking...",
+                thread_ts=thread_ts,
+            )
+            progress_ts = response["ts"]
+        except Exception:
+            logger.exception("Failed to post progress message for follow-up")
+            return
+
+        # Update session tracking with new progress message
+        if session_id in self._sessions:
+            # Update existing session data with new progress message
+            self._sessions[session_id]["progress_message_ts"] = progress_ts
+            self._sessions[session_id]["current_text"] = "🤔 Thinking..."
+        else:
+            # Create new session tracking
+            self._sessions[session_id] = {
+                "channel": message_event.channel,
+                "thread_ts": thread_ts,
+                "original_ts": message_event.ts,
+                "progress_message_ts": progress_ts,
+                "current_text": "🤔 Thinking...",
+            }
+
+        # Send to session manager - it will resume the conversation with full history
+        logger.info("Sending to session manager (will resume with history): %s", session_id)
+        await self._session_manager.handle_followup(session_id, prompt)
+
+    async def send_update(self, session_id: str, update: BridgeUpdate) -> None:
+        """Translate BridgeUpdate to Slack message edits (implements ServiceAdapter.send_update).
+
+        Args:
+            session_id: External session ID
+            update: Bridge update to send
+        """
+        session_data = self._sessions.get(session_id)
+        if not session_data:
+            logger.warning("No session data for %s, cannot send update", session_id)
+            return
+
+        try:
+            channel = session_data["channel"]
+            ts = session_data["progress_message_ts"]
+
+            if update.type == "thought":
+                # Show current thought
+                new_text = f"💭 {update.content}"
+                await self._api.update_message(channel, ts, new_text)
+                session_data["current_text"] = new_text
+
+            elif update.type == "tool_call":
+                # Append tool execution to progress message
+                current = session_data.get("current_text", "")
+                tool_name = update.content
+                new_text = f"{current}\n⚙️ `{tool_name}`"
+                await self._api.update_message(channel, ts, new_text)
+                session_data["current_text"] = new_text
+
+            elif update.type == "message_chunk":
+                # Accumulate message text for final response
+                self._message_buffers.setdefault(session_id, "")
+                self._message_buffers[session_id] += update.content
+
+            elif update.type == "plan":
+                # Format plan as structured list
+                entries = update.metadata.get("entries", [])
+                plan_text = "📋 *Plan:*\n"
+                status_icons = {
+                    "pending": "⏳",
+                    "in_progress": "▶️",
+                    "completed": "✅",
+                }
+                for entry in entries:
+                    icon = status_icons.get(entry.get("status", "pending"), "⏳")
+                    content = entry.get("content", "")
+                    plan_text += f"{icon} {content}\n"
+
+                await self._api.update_message(channel, ts, plan_text)
+                session_data["current_text"] = plan_text
+
+        except Exception:
+            logger.exception("Error sending update to Slack for %s", session_id)
+
+    async def send_completion(self, session_id: str, message: str) -> None:
+        """Send completion message (implements ServiceAdapter.send_completion).
+
+        Args:
+            session_id: External session ID
+            message: Completion message
+        """
+        # Keep session data for thread continuations (don't pop)
+        session_data = self._sessions.get(session_id)
+        if not session_data:
+            logger.warning("No session data for %s, cannot send completion", session_id)
+            return
+
+        # Use accumulated message if available, otherwise use provided message
+        final_text = self._message_buffers.pop(session_id, "") or message
+
+        try:
+            channel = session_data["channel"]
+            progress_ts = session_data["progress_message_ts"]
+            original_ts = session_data["original_ts"]
+
+            # Update progress message with final response
+            await self._api.update_message(channel, progress_ts, final_text)
+
+            # Add checkmark reaction to original mention
+            await self._api.add_reaction(channel, original_ts, "white_check_mark")
+
+            logger.info("Completed session %s", session_id)
+
+        except Exception:
+            logger.exception("Error sending completion to Slack for %s", session_id)
+
+    async def send_error(self, session_id: str, error: str) -> None:
+        """Send error message (implements ServiceAdapter.send_error).
+
+        Args:
+            session_id: External session ID
+            error: Error message
+        """
+        # Keep session data for potential retry (don't pop)
+        session_data = self._sessions.get(session_id)
+        self._message_buffers.pop(session_id, None)
+
+        if not session_data:
+            logger.warning("No session data for %s, cannot send error", session_id)
+            return
+
+        try:
+            channel = session_data["channel"]
+            progress_ts = session_data["progress_message_ts"]
+            original_ts = session_data["original_ts"]
+
+            # Update progress message with error
+            error_text = f"❌ Error: {error}"
+            await self._api.update_message(channel, progress_ts, error_text)
+
+            # Add X reaction to original mention
+            await self._api.add_reaction(channel, original_ts, "x")
+
+            logger.error("Error in session %s: %s", session_id, error)
+
+        except Exception:
+            logger.exception("Error sending error to Slack for %s", session_id)
+
+    async def close(self) -> None:
+        """Clean up resources (implements ServiceAdapter.close)."""
+        await self._socket_client.stop()
+        await self._api.close()
+        logger.info("Slack adapter closed")

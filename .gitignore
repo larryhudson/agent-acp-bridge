@@ -1,0 +1,47 @@
+# Development
+.dev.pid
+dev.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# Environment files
+.env
+.env.local
+
+# LSP bridge runtime files
+.claude/hooks/lsp-bridge.pid
+.claude/hooks/lsp-bridge.socket
+.claude/hooks/lsp-bridge.log
+
+# Session persistence and project data
+data/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/

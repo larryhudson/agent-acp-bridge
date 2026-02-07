@@ -1,0 +1,26 @@
+---
+services:
+  bridge:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Project files
+      - ./data/projects:/data/projects
+      # Session metadata (persisted across restarts)
+      - sessions-data:/var/lib/bridge
+      # Claude Code session files (persisted across restarts)
+      - claude-sessions:/root/.claude/projects
+      # Codex session files (persisted across restarts)
+      - codex-sessions:/root/.codex/sessions
+      # Mount Codex CLI credentials for codex-acp agent
+      # (run `codex login` locally first)
+      - ${HOME}/.codex/auth.json:/root/.codex/auth.json:ro
+    restart: unless-stopped
+
+volumes:
+  sessions-data:
+  claude-sessions:
+  codex-sessions:

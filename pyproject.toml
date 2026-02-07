@@ -1,0 +1,52 @@
+[project]
+name = "linear-agent-acp-bridge"
+version = "0.1.0"
+description = "Service-agnostic ACP bridge connecting external services to AI agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+    "agent-client-protocol>=0.1.0",
+    "pydantic-settings>=2.7.0",
+    "websockets>=14.0",
+    "slack-sdk>=3.36.0",
+    "PyJWT[crypto]>=2.8.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes (unused variables, imports, etc.)
+    "I",    # isort (import sorting)
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "C4",   # flake8-comprehensions
+    "RUF",  # Ruff-specific rules
+]
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+]
+unfixable = [
+    "F401",  # Unused imports - report but don't auto-remove
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.3",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.14.2",
+    "ty>=0.0.1a24",
+]

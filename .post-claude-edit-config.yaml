@@ -1,0 +1,29 @@
+---
+# Post-Claude-Edit Configuration
+# This file defines what checks/commands should run after Claude modifies files
+# Each check has:
+#   - name: A descriptive name for the check
+#   - patterns: List of glob patterns to match file paths
+#   - command: The command to run (use {file} for the file path,
+#     {dir} for parent directory)
+
+checks:
+  # Lint and format Python files with ruff
+  - name: lint-python
+    patterns: ['*.py']
+    command: 'uv run ruff check --fix {file}'
+    # Disabled because we have the LSP bridge
+    enabled: false
+
+  # Format Python files with ruff
+  - name: format-python
+    patterns: ['*.py']
+    command: 'uv run ruff format {file}'
+    # Disabled because we have the LSP bridge
+    enabled: false
+
+  # Type check Python files with ty
+  - name: type-check-python
+    patterns: ['*.py']
+    command: 'uv run ty check {file}'
+    enabled: true

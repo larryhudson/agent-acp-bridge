@@ -1,0 +1,39 @@
+{
+  "display_information": {
+    "name": "ACP Bridge Agent",
+    "description": "AI agent powered by Claude that helps with development tasks via Socket Mode",
+    "background_color": "#2c2d30",
+    "long_description": "An AI agent that uses the Agent Client Protocol (ACP) to execute development tasks. Simply @mention the bot in a channel and describe what you need help with. The agent can read files, search code, run commands, and more.\n\nFeatures:\n- Real-time progress updates as the agent works\n- Thread-based conversations for follow-ups\n- Works behind firewalls using Socket Mode\n- Context-aware responses based on your codebase"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "ACP Agent",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "reactions:write"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention",
+        "message.channels"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": false
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
