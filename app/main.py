@@ -13,6 +13,7 @@ from app.core.repo_provider import RepoProvider
 from app.core.session_manager import SessionManager
 from app.core.types import ServiceAdapter
 from app.services.github.auth import GitHubAuth
+from app.session_viewer.router import router as session_viewer_router
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# Session viewer web UI
+app.include_router(session_viewer_router)
 
 
 @app.get("/health")

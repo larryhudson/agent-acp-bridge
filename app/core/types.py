@@ -69,10 +69,11 @@ class ServiceAdapter(Protocol):
         """
         ...
 
-    async def send_completion(self, session_id: str, message: str) -> None:
+    async def send_completion(self, session_id: str, message: str, session_url: str = "") -> None:
         """Signal that the agent has completed its work.
 
         Required: Send final response/completion message to the external service.
+        session_url: Optional link to the session viewer for inspecting the full session.
         """
         ...
 

@@ -18,6 +18,8 @@ from app.core.repo_provider import RepoProvider
 from app.core.types import BridgeSessionRequest, BridgeUpdate, ServiceAdapter
 from app.core.update_router import UpdateRouter
 
+_VIEWER_URL_TEMPLATE = "{base_url}/sessions/{session_id}"
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,6 +79,13 @@ class SessionManager:
         self._persistence_file = persistence_file
         self._persisted_metadata: dict[str, Any] = {}
         self._load_sessions()
+
+    def _build_session_url(self, acp_session_id: str) -> str:
+        """Build a viewer URL for the given ACP session, or return empty string."""
+        if not settings.bridge_base_url:
+            return ""
+        base = settings.bridge_base_url.rstrip("/")
+        return _VIEWER_URL_TEMPLATE.format(base_url=base, session_id=acp_session_id)
 
     def _load_sessions(self) -> None:
         """Load persisted session metadata from disk.
@@ -210,17 +219,27 @@ class SessionManager:
             )
 
         # Send the prompt and wait for completion
+        session_url = self._build_session_url(acp_session_id)
+
         try:
             stop_reason = await acp_session.prompt(prompt)
             # Flush any remaining buffered updates
             await router.flush()
 
             if stop_reason == "end_turn":
-                await adapter.send_completion(external_id, "Work completed")
+                await adapter.send_completion(
+                    external_id, "Work completed", session_url=session_url
+                )
             elif stop_reason == "cancelled":
-                await adapter.send_completion(external_id, "Work was cancelled")
+                await adapter.send_completion(
+                    external_id, "Work was cancelled", session_url=session_url
+                )
             else:
-                await adapter.send_completion(external_id, f"Agent stopped (reason: {stop_reason})")
+                await adapter.send_completion(
+                    external_id,
+                    f"Agent stopped (reason: {stop_reason})",
+                    session_url=session_url,
+                )
         except Exception:
             logger.exception("Error during ACP prompt for %s", external_id)
             await adapter.send_error(external_id, "Agent encountered an error during execution")
@@ -297,15 +316,21 @@ class SessionManager:
         active.acp_session = acp_session
         active.update_router = router
 
+        session_url = self._build_session_url(active.acp_session_id)
+
         try:
             stop_reason = await acp_session.prompt(prompt)
             await router.flush()
 
             if stop_reason == "end_turn":
-                await adapter.send_completion(external_session_id, "Follow-up completed")
+                await adapter.send_completion(
+                    external_session_id, "Follow-up completed", session_url=session_url
+                )
             else:
                 await adapter.send_completion(
-                    external_session_id, f"Agent stopped (reason: {stop_reason})"
+                    external_session_id,
+                    f"Agent stopped (reason: {stop_reason})",
+                    session_url=session_url,
                 )
         except Exception:
             logger.exception("Error during follow-up prompt for %s", external_session_id)
