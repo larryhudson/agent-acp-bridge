@@ -47,7 +47,10 @@ def slugify(text: str, max_length: int = 60) -> str:
 
 
 class RepoProvider:
-    """Manages a shared git repo, creates branches, and installs skill files.
+    """Manages a shared git repo, creates worktrees, and installs skill files.
+
+    Each agent session gets its own git worktree so multiple sessions can run
+    concurrently without working-tree conflicts.
 
     Thread-safe via asyncio.Lock — only one session prepares the repo at a time.
     """
@@ -65,16 +68,20 @@ class RepoProvider:
         self._repo_path = (
             Path("/data/projects") / settings.github_repo if settings.github_repo else None
         )
+        self._worktrees_base = Path("/data/worktrees")
 
     async def prepare_new_session(self, descriptive_name: str, agent_name: str = "") -> RepoSession:
-        """Clone/fetch the repo and create a new branch for this session.
+        """Clone/fetch the repo and create a new worktree + branch for this session.
+
+        Each session gets its own worktree directory so multiple agents can work
+        concurrently without interfering with each other's working trees.
 
         Args:
             descriptive_name: Human-readable name for the branch (e.g. issue title).
             agent_name: Which agent this session is for (for per-agent GH_TOKEN).
 
         Returns:
-            RepoSession with cwd, branch_name, and env.
+            RepoSession with cwd (worktree path), branch_name, and env.
         """
         async with self._lock:
             await self._ensure_repo()
@@ -86,22 +93,42 @@ class RepoProvider:
             repo_path = self._repo_path
             assert repo_path is not None
 
-            # Create branch from origin/main (or origin/HEAD)
+            # Create an isolated worktree for this session
+            worktree_dir = self._worktree_path_for(slug, timestamp)
+            worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+
             default_ref = await self._get_default_ref(str(repo_path))
-            await self._run_git("checkout", "-B", branch_name, default_ref, cwd=str(repo_path))
+            await self._run_git(
+                "worktree",
+                "add",
+                "-b",
+                branch_name,
+                str(worktree_dir),
+                default_ref,
+                cwd=str(repo_path),
+            )
 
             # Install skill files
             self._install_skill_files()
 
             env = await self.build_agent_env(agent_name)
-            return RepoSession(cwd=str(repo_path), branch_name=branch_name, env=env)
+            return RepoSession(cwd=str(worktree_dir), branch_name=branch_name, env=env)
 
-    async def prepare_resume_session(self, branch_name: str, agent_name: str = "") -> RepoSession:
-        """Fetch latest and checkout an existing branch for a follow-up session.
+    async def prepare_resume_session(self, branch_name: str, cwd: str | None = None, agent_name: str = "") -> RepoSession:
+        """Fetch latest and prepare an existing worktree for a follow-up session.
+
+        If ``cwd`` points to an existing worktree directory it is reused directly.
+        Otherwise falls back to checking out the branch in the main repo (backward
+        compatibility for sessions created before worktree support).
 
         Args:
             branch_name: The branch created by prepare_new_session.
+<<<<<<< HEAD
             agent_name: Which agent this session is for (for per-agent GH_TOKEN).
+||||||| parent of 69996ff (Use git worktrees for concurrent agent session isolation)
+=======
+            cwd: The worktree path stored from the original session (if available).
+>>>>>>> 69996ff (Use git worktrees for concurrent agent session isolation)
 
         Returns:
             RepoSession with cwd, branch_name, and refreshed env.
@@ -112,13 +139,55 @@ class RepoProvider:
             repo_path = self._repo_path
             assert repo_path is not None
 
-            await self._run_git("checkout", branch_name, cwd=str(repo_path))
+            if cwd and Path(cwd).exists() and Path(cwd) != repo_path:
+                # Worktree already exists — just fetch to update remote refs
+                worktree_path = cwd
+            else:
+                # Fallback for pre-worktree sessions: checkout in the main repo
+                await self._run_git("checkout", branch_name, cwd=str(repo_path))
+                worktree_path = str(repo_path)
 
             # Re-install skill files (in case they were cleaned or updated)
             self._install_skill_files()
 
             env = await self.build_agent_env(agent_name)
-            return RepoSession(cwd=str(repo_path), branch_name=branch_name, env=env)
+            return RepoSession(cwd=worktree_path, branch_name=branch_name, env=env)
+
+    async def cleanup_worktree(self, cwd: str) -> None:
+        """Remove a git worktree and clean up its directory.
+
+        Safe to call with the main repo path — it will be skipped.
+        """
+        repo_path = self._repo_path
+        if repo_path is None:
+            return
+
+        worktree_path = Path(cwd)
+        if not worktree_path.exists():
+            return
+
+        # Never remove the main repo itself
+        if worktree_path.resolve() == repo_path.resolve():
+            return
+
+        async with self._lock:
+            try:
+                await self._run_git(
+                    "worktree", "remove", "--force", str(worktree_path), cwd=str(repo_path)
+                )
+                logger.info("Removed worktree at %s", worktree_path)
+            except RuntimeError:
+                logger.warning(
+                    "Failed to remove worktree via git at %s, cleaning up manually",
+                    worktree_path,
+                )
+                shutil.rmtree(worktree_path, ignore_errors=True)
+
+            # Prune stale worktree entries
+            try:
+                await self._run_git("worktree", "prune", cwd=str(repo_path))
+            except RuntimeError:
+                pass
 
     async def build_agent_env(self, agent_name: str = "") -> dict[str, str]:
         """Build environment variables for the agent subprocess.
@@ -169,6 +238,11 @@ class RepoProvider:
             env["LINEAR_ACCESS_TOKEN"] = settings.linear_access_token
 
         return env
+
+    def _worktree_path_for(self, slug: str, timestamp: str) -> Path:
+        """Return the filesystem path for a session worktree."""
+        assert settings.github_repo
+        return self._worktrees_base / settings.github_repo / f"{slug}-{timestamp}"
 
     async def _ensure_repo(self) -> None:
         """Ensure the configured repo is cloned locally, fetching latest if it exists."""
