@@ -47,12 +47,16 @@ def slugify(text: str, max_length: int = 60) -> str:
 
 
 class RepoProvider:
-    """Manages a shared git repo, creates worktrees, and installs skill files.
+    """Manages git repos, creates worktrees, and installs skill files.
 
     Each agent session gets its own git worktree so multiple sessions can run
     concurrently without working-tree conflicts.
 
-    Thread-safe via asyncio.Lock — only one session prepares the repo at a time.
+    Supports per-session repo overrides: each session can specify a different
+    GitHub repo and installation ID. Falls back to the global GITHUB_REPO and
+    GITHUB_INSTALLATION_ID settings when not specified.
+
+    Thread-safe via asyncio.Lock — only one session prepares a repo at a time.
     """
 
     def __init__(
@@ -65,12 +69,27 @@ class RepoProvider:
         self._auth_map = auth_map or {}  # Per-agent auth for GH_TOKEN generation
         self._enabled_services = enabled_services or settings.enabled_services_list
         self._lock = asyncio.Lock()
-        self._repo_path = (
-            Path("/data/projects") / settings.github_repo if settings.github_repo else None
-        )
         self._worktrees_base = Path("/data/worktrees")
 
-    async def prepare_new_session(self, descriptive_name: str, agent_name: str = "") -> RepoSession:
+    def _repo_path(self, github_repo: str) -> Path:
+        """Get the local path for a given repo."""
+        return Path("/data/projects") / github_repo
+
+    def _resolve_repo(self, github_repo: str = "") -> str:
+        """Resolve the repo to use: per-session override or global default."""
+        return github_repo or settings.github_repo
+
+    def _resolve_installation_id(self, github_installation_id: int = 0) -> int:
+        """Resolve the installation ID: per-session override or global default."""
+        return github_installation_id or settings.github_installation_id
+
+    async def prepare_new_session(
+        self,
+        descriptive_name: str,
+        agent_name: str = "",
+        github_repo: str = "",
+        github_installation_id: int = 0,
+    ) -> RepoSession:
         """Clone/fetch the repo and create a new worktree + branch for this session.
 
         Each session gets its own worktree directory so multiple agents can work
@@ -79,22 +98,26 @@ class RepoProvider:
         Args:
             descriptive_name: Human-readable name for the branch (e.g. issue title).
             agent_name: Which agent this session is for (for per-agent GH_TOKEN).
+            github_repo: Override repo (e.g. "owner/repo"). Falls back to default.
+            github_installation_id: Override installation ID. Falls back to default.
 
         Returns:
             RepoSession with cwd (worktree path), branch_name, and env.
         """
+        repo = self._resolve_repo(github_repo)
+        installation_id = self._resolve_installation_id(github_installation_id)
+
         async with self._lock:
-            await self._ensure_repo()
+            await self._ensure_repo(repo, installation_id)
 
             slug = slugify(descriptive_name)
             timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
             branch_name = f"acp-agent/{slug}-{timestamp}"
 
-            repo_path = self._repo_path
-            assert repo_path is not None
+            repo_path = self._repo_path(repo)
 
             # Create an isolated worktree for this session
-            worktree_dir = self._worktree_path_for(slug, timestamp)
+            worktree_dir = self._worktree_path_for(slug, timestamp, github_repo=repo)
             worktree_dir.parent.mkdir(parents=True, exist_ok=True)
 
             default_ref = await self._get_default_ref(str(repo_path))
@@ -111,11 +134,18 @@ class RepoProvider:
             # Install skill files
             self._install_skill_files()
 
-            env = await self.build_agent_env(agent_name)
+            env = await self.build_agent_env(
+                agent_name=agent_name, installation_id=installation_id
+            )
             return RepoSession(cwd=str(worktree_dir), branch_name=branch_name, env=env)
 
     async def prepare_resume_session(
-        self, branch_name: str, cwd: str | None = None, agent_name: str = ""
+        self,
+        branch_name: str,
+        cwd: str | None = None,
+        agent_name: str = "",
+        github_repo: str = "",
+        github_installation_id: int = 0,
     ) -> RepoSession:
         """Fetch latest and prepare an existing worktree for a follow-up session.
 
@@ -127,15 +157,19 @@ class RepoProvider:
             branch_name: The branch created by prepare_new_session.
             cwd: The worktree path stored from the original session (if available).
             agent_name: Which agent this session is for (for per-agent GH_TOKEN).
+            github_repo: Override repo (e.g. "owner/repo"). Falls back to default.
+            github_installation_id: Override installation ID. Falls back to default.
 
         Returns:
             RepoSession with cwd, branch_name, and refreshed env.
         """
-        async with self._lock:
-            await self._ensure_repo()
+        repo = self._resolve_repo(github_repo)
+        installation_id = self._resolve_installation_id(github_installation_id)
 
-            repo_path = self._repo_path
-            assert repo_path is not None
+        async with self._lock:
+            await self._ensure_repo(repo, installation_id)
+
+            repo_path = self._repo_path(repo)
 
             if cwd and Path(cwd).exists() and Path(cwd).resolve() != repo_path.resolve():
                 # Worktree already exists — just fetch to update remote refs
@@ -148,18 +182,23 @@ class RepoProvider:
             # Re-install skill files (in case they were cleaned or updated)
             self._install_skill_files()
 
-            env = await self.build_agent_env(agent_name)
+            env = await self.build_agent_env(
+                agent_name=agent_name, installation_id=installation_id
+            )
             return RepoSession(cwd=worktree_path, branch_name=branch_name, env=env)
 
-    async def cleanup_worktree(self, cwd: str, branch_name: str = "") -> None:
+    async def cleanup_worktree(
+        self, cwd: str, branch_name: str = "", github_repo: str = ""
+    ) -> None:
         """Remove a git worktree, its branch, and clean up its directory.
 
         Safe to call with the main repo path — it will be skipped.
         """
-        repo_path = self._repo_path
-        if repo_path is None:
+        repo = self._resolve_repo(github_repo)
+        if not repo:
             return
 
+        repo_path = self._repo_path(repo)
         worktree_path = Path(cwd)
         if not worktree_path.exists():
             return
@@ -193,13 +232,22 @@ class RepoProvider:
                     await self._run_git("branch", "-D", branch_name, cwd=str(repo_path))
                     logger.info("Deleted branch %s", branch_name)
                 except RuntimeError:
-                    logger.debug("Could not delete branch %s (may already be gone)", branch_name)
+                    logger.debug(
+                        "Could not delete branch %s (may already be gone)", branch_name
+                    )
 
-    async def build_agent_env(self, agent_name: str = "") -> dict[str, str]:
+    async def build_agent_env(
+        self, agent_name: str = "", installation_id: int = 0
+    ) -> dict[str, str]:
         """Build environment variables for the agent subprocess.
 
         Forwards API keys and generates fresh tokens for enabled services.
         Uses agent-specific GitHub auth/installation when available.
+
+        Args:
+            agent_name: Which agent to build env for (for per-agent auth).
+            installation_id: GitHub installation ID for token generation.
+                Falls back to agent-specific or global default if 0.
         """
         env: dict[str, str] = {}
 
@@ -208,24 +256,23 @@ class RepoProvider:
         if settings.openai_api_key:
             env["OPENAI_API_KEY"] = settings.openai_api_key
 
-        # GitHub token — use agent-specific auth + installation ID if available
+        # GitHub token — use agent-specific auth + per-session installation ID
         if "github" in self._enabled_services:
             auth = self._auth_map.get(agent_name, self._auth) if agent_name else self._auth
             if auth is not None:
                 try:
-                    # Look up agent-specific installation ID, fall back to default
-                    installation_id_str = (
-                        settings.get_service_credential("GITHUB_INSTALLATION_ID", agent_name)
-                        if agent_name
-                        else ""
-                    )
-                    installation_id = (
-                        int(installation_id_str)
-                        if installation_id_str
-                        else settings.github_installation_id
-                    )
-                    if installation_id:
-                        token = await auth.get_installation_token(installation_id)
+                    # Per-session installation_id overrides agent-specific and global defaults
+                    effective_id = installation_id
+                    if not effective_id and agent_name:
+                        id_str = settings.get_service_credential(
+                            "GITHUB_INSTALLATION_ID", agent_name
+                        )
+                        if id_str:
+                            effective_id = int(id_str)
+                    if not effective_id:
+                        effective_id = settings.github_installation_id
+                    if effective_id:
+                        token = await auth.get_installation_token(effective_id)
                         env["GH_TOKEN"] = token
                 except Exception:
                     logger.exception(
@@ -245,54 +292,62 @@ class RepoProvider:
 
         return env
 
-    def _worktree_path_for(self, slug: str, timestamp: str) -> Path:
+    def _worktree_path_for(
+        self, slug: str, timestamp: str, github_repo: str = ""
+    ) -> Path:
         """Return the filesystem path for a session worktree."""
-        assert settings.github_repo
-        return self._worktrees_base / settings.github_repo / f"{slug}-{timestamp}"
+        repo = self._resolve_repo(github_repo)
+        assert repo
+        return self._worktrees_base / repo / f"{slug}-{timestamp}"
 
-    async def _ensure_repo(self) -> None:
-        """Ensure the configured repo is cloned locally, fetching latest if it exists."""
-        if not settings.github_repo:
-            logger.warning("No github_repo configured — skipping repo setup")
+    async def _ensure_repo(self, github_repo: str, installation_id: int) -> None:
+        """Ensure the given repo is cloned locally, fetching latest if it exists."""
+        if not github_repo:
+            logger.warning("No github_repo specified — skipping repo setup")
             return
 
-        repo_path = self._repo_path
-        assert repo_path is not None
+        repo_path = self._repo_path(github_repo)
 
         if repo_path.exists():
-            logger.info("Fetching latest for %s", settings.github_repo)
+            logger.info("Fetching latest for %s", github_repo)
             # Update remote URL with fresh token
-            token = await self._get_repo_token()
+            token = await self._get_repo_token(github_repo, installation_id)
             if token:
                 await self._run_git(
                     "remote",
                     "set-url",
                     "origin",
-                    f"https://x-access-token:{token}@github.com/{settings.github_repo}.git",
+                    f"https://x-access-token:{token}@github.com/{github_repo}.git",
                     cwd=str(repo_path),
                 )
             await self._run_git("fetch", "origin", cwd=str(repo_path))
         else:
-            logger.info("Cloning %s into %s", settings.github_repo, repo_path)
+            logger.info("Cloning %s into %s", github_repo, repo_path)
             repo_path.parent.mkdir(parents=True, exist_ok=True)
-            token = await self._get_repo_token()
+            token = await self._get_repo_token(github_repo, installation_id)
             if token:
-                clone_url = f"https://x-access-token:{token}@github.com/{settings.github_repo}.git"
+                clone_url = (
+                    f"https://x-access-token:{token}@github.com/{github_repo}.git"
+                )
             else:
-                clone_url = f"https://github.com/{settings.github_repo}.git"
+                clone_url = f"https://github.com/{github_repo}.git"
             await self._run_git("clone", clone_url, str(repo_path))
 
-    async def _get_repo_token(self) -> str | None:
+    async def _get_repo_token(
+        self, github_repo: str, installation_id: int
+    ) -> str | None:
         """Get a GitHub token for repo operations."""
         if self._auth is None:
             return None
-        installation_id = settings.github_installation_id
-        if not installation_id:
+        resolved_id = self._resolve_installation_id(installation_id)
+        if not resolved_id:
             return None
         try:
-            return await self._auth.get_installation_token(installation_id)
+            return await self._auth.get_installation_token(resolved_id)
         except Exception:
-            logger.exception("Failed to get installation token for repo operations")
+            logger.exception(
+                "Failed to get installation token for repo %s", github_repo
+            )
             return None
 
     async def _get_default_ref(self, cwd: str) -> str:
@@ -320,7 +375,9 @@ class RepoProvider:
         elif SKILLS_SOURCE_DIR_LOCAL.exists():
             source = SKILLS_SOURCE_DIR_LOCAL
         else:
-            logger.warning("No skills source directory found — skipping skill installation")
+            logger.warning(
+                "No skills source directory found — skipping skill installation"
+            )
             return
 
         # Target directories (global agent skill dirs, not inside the repo)
