@@ -420,7 +420,7 @@ class SessionManager:
         """Remove a session from tracking, clean up its worktree, and persist."""
         active = self._active_sessions.get(external_session_id)
         if active is not None:
-            await self._repo_provider.cleanup_worktree(active.cwd)
+            await self._repo_provider.cleanup_worktree(active.cwd, branch_name=active.branch_name)
             del self._active_sessions[external_session_id]
             self._save_sessions()
             logger.info("Removed session %s from tracking", external_session_id)

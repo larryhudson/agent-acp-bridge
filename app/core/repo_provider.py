@@ -114,7 +114,9 @@ class RepoProvider:
             env = await self.build_agent_env(agent_name)
             return RepoSession(cwd=str(worktree_dir), branch_name=branch_name, env=env)
 
-    async def prepare_resume_session(self, branch_name: str, cwd: str | None = None, agent_name: str = "") -> RepoSession:
+    async def prepare_resume_session(
+        self, branch_name: str, cwd: str | None = None, agent_name: str = ""
+    ) -> RepoSession:
         """Fetch latest and prepare an existing worktree for a follow-up session.
 
         If ``cwd`` points to an existing worktree directory it is reused directly.
@@ -123,12 +125,8 @@ class RepoProvider:
 
         Args:
             branch_name: The branch created by prepare_new_session.
-<<<<<<< HEAD
-            agent_name: Which agent this session is for (for per-agent GH_TOKEN).
-||||||| parent of 69996ff (Use git worktrees for concurrent agent session isolation)
-=======
             cwd: The worktree path stored from the original session (if available).
->>>>>>> 69996ff (Use git worktrees for concurrent agent session isolation)
+            agent_name: Which agent this session is for (for per-agent GH_TOKEN).
 
         Returns:
             RepoSession with cwd, branch_name, and refreshed env.
@@ -153,8 +151,8 @@ class RepoProvider:
             env = await self.build_agent_env(agent_name)
             return RepoSession(cwd=worktree_path, branch_name=branch_name, env=env)
 
-    async def cleanup_worktree(self, cwd: str) -> None:
-        """Remove a git worktree and clean up its directory.
+    async def cleanup_worktree(self, cwd: str, branch_name: str = "") -> None:
+        """Remove a git worktree, its branch, and clean up its directory.
 
         Safe to call with the main repo path — it will be skipped.
         """
@@ -188,6 +186,14 @@ class RepoProvider:
                 await self._run_git("worktree", "prune", cwd=str(repo_path))
             except RuntimeError:
                 pass
+
+            # Delete the orphaned branch to avoid accumulating stale refs
+            if branch_name:
+                try:
+                    await self._run_git("branch", "-D", branch_name, cwd=str(repo_path))
+                    logger.info("Deleted branch %s", branch_name)
+                except RuntimeError:
+                    logger.debug("Could not delete branch %s (may already be gone)", branch_name)
 
     async def build_agent_env(self, agent_name: str = "") -> dict[str, str]:
         """Build environment variables for the agent subprocess.
