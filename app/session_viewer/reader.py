@@ -18,7 +18,7 @@ def find_session_file(session_id: str) -> Path | None:
     """Search known session directories for a JSONL file matching the session ID.
 
     Claude Code stores sessions as: /root/.claude/projects/{project_dir}/{session_id}.jsonl
-    Codex stores sessions in: /root/.codex/sessions/{session_id}/
+    Codex stores sessions in a date hierarchy: /root/.codex/sessions/YYYY/MM/DD/{session_id}.jsonl
 
     Returns the path to the JSONL file, or None if not found.
     """
@@ -29,13 +29,10 @@ def find_session_file(session_id: str) -> Path | None:
             if "subagents" not in jsonl_path.parts:
                 return jsonl_path
 
-    # Search Codex sessions
+    # Search Codex sessions (use rglob to handle date hierarchy)
     if CODEX_SESSIONS_ROOT.exists():
-        codex_dir = CODEX_SESSIONS_ROOT / session_id
-        if codex_dir.is_dir():
-            # Look for any JSONL file inside
-            for jsonl_path in codex_dir.glob("*.jsonl"):
-                return jsonl_path
+        for jsonl_path in CODEX_SESSIONS_ROOT.rglob(f"{session_id}.jsonl"):
+            return jsonl_path
 
     return None
 
