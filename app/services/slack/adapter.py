@@ -432,6 +432,7 @@ class SlackAdapter:
             if update.type == "thought":
                 # Show current thought
                 new_text = f"💭 {update.content}"
+                new_text = _truncate_for_slack(new_text)
                 await self._api.update_message(channel, ts, new_text)
                 session_data["current_text"] = new_text
 
@@ -446,6 +447,7 @@ class SlackAdapter:
                     while len("\n".join(lines)) > SLACK_MAX_MESSAGE_LENGTH and len(lines) > 1:
                         lines.pop(0)
                     new_text = "_(earlier tool calls trimmed)_\n" + "\n".join(lines)
+                new_text = _truncate_for_slack(new_text)
                 await self._api.update_message(channel, ts, new_text)
                 session_data["current_text"] = new_text
 
@@ -468,6 +470,7 @@ class SlackAdapter:
                     content = entry.get("content", "")
                     plan_text += f"{icon} {content}\n"
 
+                plan_text = _truncate_for_slack(plan_text)
                 await self._api.update_message(channel, ts, plan_text)
                 session_data["current_text"] = plan_text
 
