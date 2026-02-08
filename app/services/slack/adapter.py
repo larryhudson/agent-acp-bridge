@@ -463,9 +463,9 @@ class SlackAdapter:
                 tool_name = update.content
                 new_text = f"{current}\n⚙️ `{tool_name}`"
                 # Trim old lines from the top if too long
-                if len(new_text) > SLACK_MAX_MESSAGE_LENGTH:
+                if len(new_text.encode("utf-8")) > SLACK_MAX_MESSAGE_BYTES:
                     lines = new_text.split("\n")
-                    while len("\n".join(lines)) > SLACK_MAX_MESSAGE_LENGTH and len(lines) > 1:
+                    while len("\n".join(lines)) > SLACK_MAX_MESSAGE_BYTES and len(lines) > 1:
                         lines.pop(0)
                     new_text = "_(earlier tool calls trimmed)_\n" + "\n".join(lines)
                 new_text = _truncate_for_slack(new_text)
