@@ -89,7 +89,9 @@ class SlackAdapter:
                 await self._api.update_message(channel, ts, truncated)
             except RuntimeError as exc_retry:
                 if "msg_too_long" in str(exc_retry):
-                    logger.error("Slack msg_too_long persists for %s:%s after retry; giving up", channel, ts)
+                    logger.error(
+                        "Slack msg_too_long persists for %s:%s after retry; giving up", channel, ts
+                    )
                     return
                 raise
 
