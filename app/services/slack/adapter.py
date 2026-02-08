@@ -18,19 +18,23 @@ from app.services.slack.socket_client import SlackSocketClient
 logger = logging.getLogger(__name__)
 
 # Slack's message limit is ~40k characters; use a conservative threshold.
-SLACK_MAX_MESSAGE_LENGTH = 30_000
 SLACK_TRUNCATION_NOTICE = "\n\n_(message truncated — too long for Slack)_"
+SLACK_MAX_MESSAGE_BYTES = 20_000
+SLACK_RETRY_MAX_MESSAGE_BYTES = 4_000
 
 
-def _truncate_for_slack(text: str) -> str:
-    if len(text) <= SLACK_MAX_MESSAGE_LENGTH:
+def _truncate_for_slack(text: str, max_bytes: int = SLACK_MAX_MESSAGE_BYTES) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
         return text
 
-    max_len = SLACK_MAX_MESSAGE_LENGTH - len(SLACK_TRUNCATION_NOTICE)
-    if max_len <= 0:
-        return SLACK_TRUNCATION_NOTICE[:SLACK_MAX_MESSAGE_LENGTH]
+    notice = SLACK_TRUNCATION_NOTICE.encode("utf-8")
+    max_body_bytes = max_bytes - len(notice)
+    if max_body_bytes <= 0:
+        return notice[:max_bytes].decode("utf-8", errors="ignore")
 
-    return text[:max_len] + SLACK_TRUNCATION_NOTICE
+    truncated = encoded[:max_body_bytes].decode("utf-8", errors="ignore")
+    return truncated + SLACK_TRUNCATION_NOTICE
 
 
 class SlackAdapter:
@@ -71,6 +75,43 @@ class SlackAdapter:
         self._active_threads: set[tuple[str, str]] = set()
         # Cache user display names to avoid repeated API calls
         self._user_name_cache: dict[str, str] = {}
+
+    async def _safe_update_message(self, channel: str, ts: str, text: str) -> None:
+        try:
+            await self._api.update_message(channel, ts, text)
+        except RuntimeError as exc:
+            if "msg_too_long" not in str(exc):
+                raise
+
+            logger.warning("Slack msg_too_long for %s:%s; retrying with shorter text", channel, ts)
+            truncated = _truncate_for_slack(text, max_bytes=SLACK_RETRY_MAX_MESSAGE_BYTES)
+            try:
+                await self._api.update_message(channel, ts, truncated)
+            except RuntimeError as exc_retry:
+                if "msg_too_long" in str(exc_retry):
+                    logger.error(
+                        "Slack msg_too_long persists for %s:%s after retry; giving up", channel, ts
+                    )
+                    return
+                raise
+
+    async def _post_fallback_message(self, session_data: dict[str, Any], text: str) -> bool:
+        channel = session_data["channel"]
+        thread_ts = session_data.get("thread_ts")
+        truncated = _truncate_for_slack(text, max_bytes=SLACK_RETRY_MAX_MESSAGE_BYTES)
+
+        try:
+            response = await self._api.post_message(
+                channel=channel,
+                text=truncated,
+                thread_ts=thread_ts,
+            )
+            session_data["progress_message_ts"] = response["ts"]
+            session_data["current_text"] = truncated
+            return True
+        except Exception:
+            logger.exception("Failed to post fallback progress message for %s", channel)
+            return False
 
     def register_routes(self, app: FastAPI) -> None:
         """No routes needed for Socket Mode (implements ServiceAdapter.register_routes)."""
@@ -433,7 +474,9 @@ class SlackAdapter:
                 # Show current thought
                 new_text = f"💭 {update.content}"
                 new_text = _truncate_for_slack(new_text)
-                await self._api.update_message(channel, ts, new_text)
+                update_ok = await self._safe_update_message(channel, ts, new_text)
+                if not update_ok:
+                    await self._post_fallback_message(session_data, new_text)
                 session_data["current_text"] = new_text
 
             elif update.type == "tool_call":
@@ -442,13 +485,13 @@ class SlackAdapter:
                 tool_name = update.content
                 new_text = f"{current}\n⚙️ `{tool_name}`"
                 # Trim old lines from the top if too long
-                if len(new_text) > SLACK_MAX_MESSAGE_LENGTH:
+                if len(new_text.encode("utf-8")) > SLACK_MAX_MESSAGE_BYTES:
                     lines = new_text.split("\n")
-                    while len("\n".join(lines)) > SLACK_MAX_MESSAGE_LENGTH and len(lines) > 1:
+                    while len("\n".join(lines)) > SLACK_MAX_MESSAGE_BYTES and len(lines) > 1:
                         lines.pop(0)
                     new_text = "_(earlier tool calls trimmed)_\n" + "\n".join(lines)
                 new_text = _truncate_for_slack(new_text)
-                await self._api.update_message(channel, ts, new_text)
+                await self._safe_update_message(channel, ts, new_text)
                 session_data["current_text"] = new_text
 
             elif update.type == "message_chunk":
@@ -471,7 +514,9 @@ class SlackAdapter:
                     plan_text += f"{icon} {content}\n"
 
                 plan_text = _truncate_for_slack(plan_text)
-                await self._api.update_message(channel, ts, plan_text)
+                update_ok = await self._safe_update_message(channel, ts, plan_text)
+                if not update_ok:
+                    await self._post_fallback_message(session_data, plan_text)
                 session_data["current_text"] = plan_text
 
         except Exception:
@@ -507,7 +552,9 @@ class SlackAdapter:
             original_ts = session_data["original_ts"]
 
             # Update progress message with final response
-            await self._api.update_message(channel, progress_ts, final_text)
+            update_ok = await self._safe_update_message(channel, progress_ts, final_text)
+            if not update_ok:
+                await self._post_fallback_message(session_data, final_text)
 
             # Add checkmark reaction to original mention
             await self._api.add_reaction(channel, original_ts, "white_check_mark")
@@ -539,7 +586,9 @@ class SlackAdapter:
 
             # Update progress message with error
             error_text = f"❌ Error: {error}"
-            await self._api.update_message(channel, progress_ts, error_text)
+            update_ok = await self._safe_update_message(channel, progress_ts, error_text)
+            if not update_ok:
+                await self._post_fallback_message(session_data, error_text)
 
             # Add X reaction to original mention
             await self._api.add_reaction(channel, original_ts, "x")
