@@ -283,7 +283,7 @@ class SessionManager:
         if active.branch_name:
             try:
                 repo_session = await self._repo_provider.prepare_resume_session(
-                    active.branch_name, agent_name=agent_name
+                    active.branch_name, cwd=active.cwd, agent_name=agent_name
                 )
                 env = repo_session.env or None
             except Exception:
@@ -416,9 +416,11 @@ class SessionManager:
             if session.service_name == service_name
         }
 
-    def remove_session(self, external_session_id: str) -> None:
-        """Remove a session from tracking and persist the change."""
-        if external_session_id in self._active_sessions:
+    async def remove_session(self, external_session_id: str) -> None:
+        """Remove a session from tracking, clean up its worktree, and persist."""
+        active = self._active_sessions.get(external_session_id)
+        if active is not None:
+            await self._repo_provider.cleanup_worktree(active.cwd, branch_name=active.branch_name)
             del self._active_sessions[external_session_id]
             self._save_sessions()
             logger.info("Removed session %s from tracking", external_session_id)

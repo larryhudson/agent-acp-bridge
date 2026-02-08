@@ -36,7 +36,7 @@ COPY main.py .
 RUN python3 -m pip install --break-system-packages .
 
 # Create data directory
-RUN mkdir -p /data/projects
+RUN mkdir -p /data/projects /data/worktrees
 
 # Configure Codex CLI for autonomous operation (no permission prompts)
 RUN mkdir -p /root/.codex && printf '%s\n' \

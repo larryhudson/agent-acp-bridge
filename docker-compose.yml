@@ -9,6 +9,8 @@ services:
     volumes:
       # Project files
       - ./data/projects:/data/projects
+      # Git worktrees for concurrent agent sessions
+      - ./data/worktrees:/data/worktrees
       # Session metadata (persisted across restarts)
       - sessions-data:/var/lib/bridge
       # Claude Code session files (persisted across restarts)
