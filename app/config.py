@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     github_webhook_secret: str = ""
     github_bot_login: str = ""  # Optional fallback if auto-detect fails
 
+    # Worktree cleanup
+    worktree_cleanup_enabled: bool = True  # Enable periodic cleanup of stale worktrees
+    worktree_cleanup_age_days: int = 3  # Remove worktrees older than this many days
+    worktree_cleanup_interval_hours: int = 1  # How often to run cleanup (in hours)
+
     @property
     def github_private_key_bytes(self) -> bytes:
         """Convert the PEM key string (with escaped newlines) to bytes."""

@@ -8,7 +8,7 @@ import logging
 import re
 import shutil
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -229,6 +229,96 @@ class RepoProvider:
                     logger.info("Deleted branch %s", branch_name)
                 except RuntimeError:
                     logger.debug("Could not delete branch %s (may already be gone)", branch_name)
+
+    async def cleanup_stale_worktrees(
+        self, age_threshold_days: int = 3, active_sessions: set[str] | None = None
+    ) -> int:
+        """Remove worktrees older than the specified threshold.
+
+        Args:
+            age_threshold_days: Remove worktrees older than this many days.
+            active_sessions: Set of cwd paths for active sessions (won't be removed).
+
+        Returns:
+            Number of worktrees cleaned up.
+        """
+        if not self._worktrees_base.exists():
+            return 0
+
+        active_sessions = active_sessions or set()
+        cutoff_time = datetime.now(UTC) - timedelta(days=age_threshold_days)
+        cleaned_count = 0
+
+        async with self._lock:
+            # Iterate through all repos
+            for repo_dir in self._worktrees_base.iterdir():
+                if not repo_dir.is_dir():
+                    continue
+
+                repo_path = self._repo_path(repo_dir.name)
+                if not repo_path.exists():
+                    # Repo was deleted but worktrees remain — clean them up
+                    logger.info("Removing worktrees for deleted repo: %s", repo_dir.name)
+                    shutil.rmtree(repo_dir, ignore_errors=True)
+                    cleaned_count += sum(1 for _ in repo_dir.iterdir() if _.is_dir())
+                    continue
+
+                # Check each worktree directory
+                for worktree_dir in repo_dir.iterdir():
+                    if not worktree_dir.is_dir():
+                        continue
+
+                    # Skip active sessions
+                    if str(worktree_dir) in active_sessions:
+                        continue
+
+                    # Check modification time
+                    try:
+                        mtime = datetime.fromtimestamp(worktree_dir.stat().st_mtime, UTC)
+                        if mtime < cutoff_time:
+                            # Extract branch name from directory (format: slug-timestamp)
+                            dir_name = worktree_dir.name
+                            # Branch format: acp-agent/{slug}-{timestamp}
+                            branch_name = f"acp-agent/{dir_name}"
+
+                            logger.info(
+                                "Cleaning up stale worktree: %s (age: %s)",
+                                worktree_dir,
+                                datetime.now(UTC) - mtime,
+                            )
+
+                            # Remove worktree
+                            try:
+                                await self._run_git(
+                                    "worktree", "remove", "--force", str(worktree_dir), cwd=str(repo_path)
+                                )
+                            except RuntimeError:
+                                logger.warning(
+                                    "Failed to remove worktree via git, cleaning up manually: %s",
+                                    worktree_dir,
+                                )
+                                shutil.rmtree(worktree_dir, ignore_errors=True)
+
+                            # Delete the branch
+                            try:
+                                await self._run_git("branch", "-D", branch_name, cwd=str(repo_path))
+                            except RuntimeError:
+                                logger.debug("Could not delete branch %s (may already be gone)", branch_name)
+
+                            cleaned_count += 1
+                    except Exception:
+                        logger.exception("Error checking worktree %s", worktree_dir)
+
+                # Prune stale worktree entries for this repo
+                try:
+                    await self._run_git("worktree", "prune", cwd=str(repo_path))
+                except RuntimeError:
+                    pass
+
+        if cleaned_count > 0:
+            logger.info("Cleaned up %d stale worktree(s)", cleaned_count)
+
+        return cleaned_count
 
     async def build_agent_env(
         self, agent_name: str = "", installation_id: int = 0
