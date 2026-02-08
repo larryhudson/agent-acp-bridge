@@ -8,7 +8,6 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from app.config import settings
 from app.core.repo_provider import slugify
 from app.core.types import BridgeSessionRequest, BridgeUpdate
 from app.services.slack.api_client import SlackApiClient
@@ -31,16 +30,25 @@ class SlackAdapter:
     - Session lifecycle management
     """
 
-    service_name: str = "slack"
-
-    def __init__(self, session_manager: Any) -> None:
+    def __init__(
+        self,
+        session_manager: Any,
+        agent_name: str,
+        bot_token: str,
+        app_token: str,
+    ) -> None:
         self._session_manager = session_manager
-        self._api = SlackApiClient(settings.slack_bot_token)
+        self._agent_name = agent_name
+        # Unique service_name per agent for session tracking
+        self.service_name: str = f"slack:{agent_name}" if agent_name else "slack"
+        self._api = SlackApiClient(bot_token)
         self._socket_client = SlackSocketClient(
-            app_token=settings.slack_app_token,
-            bot_token=settings.slack_bot_token,
+            app_token=app_token,
+            bot_token=bot_token,
             on_event=self._handle_event,
         )
+        # Bot's own Slack user ID (fetched at startup via auth.test)
+        self._bot_user_id: str | None = None
         # Track session data: {session_id: {channel, thread_ts, progress_message_ts, ...}}
         self._sessions: dict[str, dict[str, Any]] = {}
         # Accumulate message chunks for final response
@@ -48,13 +56,26 @@ class SlackAdapter:
         # Track threads where bot has been mentioned (persists after session completion)
         # Format: {(channel, thread_ts)}
         self._active_threads: set[tuple[str, str]] = set()
+        # Cache user display names to avoid repeated API calls
+        self._user_name_cache: dict[str, str] = {}
 
     def register_routes(self, app: FastAPI) -> None:
         """No routes needed for Socket Mode (implements ServiceAdapter.register_routes)."""
         pass
 
     async def start(self) -> None:
-        """Start the Socket Mode client (implements ServiceAdapter.start)."""
+        """Start the Socket Mode client and detect bot user ID."""
+        try:
+            auth_info = await self._api.auth_test()
+            self._bot_user_id = auth_info.get("user_id")
+            logger.info(
+                "Slack bot identity: user_id=%s, user=%s",
+                self._bot_user_id,
+                auth_info.get("user"),
+            )
+        except Exception:
+            logger.exception("Failed to get bot identity via auth.test")
+
         self._socket_client.start()
         logger.info("Slack Socket Mode client started")
 
@@ -105,6 +126,70 @@ class SlackAdapter:
         except Exception:
             logger.exception("Error handling event type %s", event_type)
 
+    async def _fetch_thread_context(
+        self,
+        channel: str,
+        thread_ts: str,
+        exclude_ts: str | None = None,
+    ) -> str:
+        """Fetch Slack thread history and format as context for the agent prompt.
+
+        Args:
+            channel: Channel ID
+            thread_ts: Thread parent timestamp
+            exclude_ts: Message timestamp to exclude (the current message)
+
+        Returns:
+            Formatted thread history string, or empty string if no history.
+        """
+        try:
+            replies = await self._api.get_thread_replies(channel, thread_ts)
+        except Exception:
+            logger.warning("Failed to fetch thread history", exc_info=True)
+            return ""
+
+        if not replies:
+            return ""
+
+        # Exclude the current message to avoid duplicating it in the prompt
+        if exclude_ts:
+            replies = [r for r in replies if r.get("ts") != exclude_ts]
+
+        if not replies:
+            return ""
+
+        # Resolve user display names (cached)
+        user_ids = {msg["user"] for msg in replies if msg.get("user")}
+        for uid in user_ids:
+            if uid not in self._user_name_cache:
+                try:
+                    info = await self._api.get_user_info(uid)
+                    self._user_name_cache[uid] = info.get("real_name") or info.get("name") or uid
+                except Exception:
+                    self._user_name_cache[uid] = uid
+
+        # Format each message
+        lines = []
+        for msg in replies:
+            user_id = msg.get("user", "")
+            name = self._user_name_cache.get(user_id, user_id) if user_id else "bot"
+            text = msg.get("text", "")
+            lines.append(f"{name}: {text}")
+
+        if not lines:
+            return ""
+
+        context = "\n".join(lines)
+
+        # Cap total length to avoid overwhelming the prompt
+        max_context_length = 20_000
+        if len(context) > max_context_length:
+            context = "...(earlier messages trimmed)...\n" + context[-max_context_length:]
+
+        return (
+            "Here is the conversation history from this Slack thread:\n\n" + context + "\n\n---\n\n"
+        )
+
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:
         """Handle app_mention event (new session).
 
@@ -124,9 +209,12 @@ class SlackAdapter:
             logger.exception("Failed to parse app_mention event: %s", event)
             return
 
-        # Create session ID from channel and thread
+        # Create session ID from channel, thread, and agent name
         thread_ts = mention_event.thread_ts or mention_event.ts
-        session_id = f"slack:{mention_event.channel}:{thread_ts}"
+        if self._agent_name:
+            session_id = f"slack:{mention_event.channel}:{thread_ts}:{self._agent_name}"
+        else:
+            session_id = f"slack:{mention_event.channel}:{thread_ts}"
 
         # DEBUG: Log what sessions we have
         logger.info(
@@ -151,11 +239,19 @@ class SlackAdapter:
             )
             return
 
+        # Fetch thread history if this mention is inside an existing thread
+        thread_context = ""
+        if mention_event.thread_ts:
+            thread_context = await self._fetch_thread_context(
+                mention_event.channel, thread_ts, exclude_ts=mention_event.ts
+            )
+
         logger.info(
-            "New Slack session: %s (channel=%s, thread=%s)",
+            "New Slack session: %s (channel=%s, thread=%s, has_thread_context=%s)",
             session_id,
             mention_event.channel,
             thread_ts,
+            bool(thread_context),
         )
 
         # Post initial "thinking" message
@@ -183,11 +279,12 @@ class SlackAdapter:
         # Mark this thread as active (will persist after session ends)
         self._active_threads.add((mention_event.channel, thread_ts))
 
-        # Create bridge request
+        # Create bridge request (service_name stays "slack" for project mapping)
         request = BridgeSessionRequest(
             external_session_id=session_id,
-            service_name=self.service_name,
-            prompt=prompt,
+            service_name="slack",
+            prompt=thread_context + prompt,
+            agent_name=self._agent_name,
             descriptive_name=slugify(prompt[:60]),
             service_metadata=session_data,
         )
@@ -232,16 +329,24 @@ class SlackAdapter:
         if not thread_ts:
             return
 
+        # Require @mention of this bot — don't respond to untagged thread messages
+        text = message_event.text or ""
+        if not self._bot_user_id or f"<@{self._bot_user_id}>" not in text:
+            return
+
         # Check if this thread is one where the bot has been mentioned
         thread_key = (message_event.channel, thread_ts)
         if thread_key not in self._active_threads:
             logger.debug("Thread %s not active, ignoring message", thread_key)
             return
 
-        session_id = f"slack:{message_event.channel}:{thread_ts}"
+        if self._agent_name:
+            session_id = f"slack:{message_event.channel}:{thread_ts}:{self._agent_name}"
+        else:
+            session_id = f"slack:{message_event.channel}:{thread_ts}"
 
-        # Get the prompt text
-        prompt = (message_event.text or "").strip()
+        # Strip the @mention and get the prompt text
+        prompt = re.sub(r"<@\w+>\s*", "", text).strip()
         if not prompt:
             return
 
@@ -276,9 +381,14 @@ class SlackAdapter:
                 "current_text": "🤔 Thinking...",
             }
 
+        # Fetch thread history so the agent sees messages from other users/agents
+        thread_context = await self._fetch_thread_context(
+            message_event.channel, thread_ts, exclude_ts=message_event.ts
+        )
+
         # Send to session manager - it will resume the conversation with full history
         logger.info("Sending to session manager (will resume with history): %s", session_id)
-        await self._session_manager.handle_followup(session_id, prompt)
+        await self._session_manager.handle_followup(session_id, thread_context + prompt)
 
     async def send_update(self, session_id: str, update: BridgeUpdate) -> None:
         """Translate BridgeUpdate to Slack message edits (implements ServiceAdapter.send_update).

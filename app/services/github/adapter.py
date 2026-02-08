@@ -34,19 +34,30 @@ class GitHubAdapter:
     - Session lifecycle management
     """
 
-    service_name: str = "github"
-
-    def __init__(self, session_manager: Any, auth: GitHubAuth | None = None) -> None:
+    def __init__(
+        self,
+        session_manager: Any,
+        agent_name: str = "",
+        webhook_secret: str = "",
+        route_path: str = "/webhooks/github",
+        auth: GitHubAuth | None = None,
+        bot_login: str = "",
+    ) -> None:
         self._session_manager = session_manager
+        self._agent_name = agent_name
+        # Unique service_name per agent for session tracking
+        self.service_name: str = f"github:{agent_name}" if agent_name else "github"
         self._auth = auth or GitHubAuth()
         self._api = GitHubApiClient(self._auth)
-        self._bot_login: str | None = settings.github_bot_login or None
+        self._webhook_secret = webhook_secret or settings.github_webhook_secret
+        self._route_path = route_path
+        self._bot_login: str | None = bot_login or settings.github_bot_login or None
         # Track session data: {session_id: {owner, repo, issue_number, ...}}
         self._sessions: dict[str, dict[str, Any]] = {}
         # Accumulate message chunks for final response
         self._message_buffers: dict[str, str] = {}
         # Track issues/PRs where bot has been mentioned (persists after session completion)
-        # Format: {session_id} — e.g. "github:owner/repo:42"
+        # Format: {session_id} — e.g. "github:owner/repo:42:agent_name"
         self._active_issues: set[str] = set()
         # Keep references to background tasks so they aren't garbage collected
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -75,15 +86,17 @@ class GitHubAdapter:
 
     def register_routes(self, app: FastAPI) -> None:
         """Register the GitHub webhook endpoint."""
+        # Capture instance refs for the closure
+        adapter = self
 
-        @app.post("/webhooks/github")
+        @app.post(self._route_path)
         async def handle_github_webhook(request: Request) -> Response:
             raw_body = await request.body()
 
             # Verify signature
             signature = request.headers.get("X-Hub-Signature-256", "")
-            if settings.github_webhook_secret and not verify_signature(
-                raw_body, signature, settings.github_webhook_secret
+            if adapter._webhook_secret and not verify_signature(
+                raw_body, signature, adapter._webhook_secret
             ):
                 logger.warning("Invalid GitHub webhook signature")
                 return Response(status_code=400)
@@ -160,6 +173,67 @@ class GitHubAdapter:
         prompt = pattern.sub("", body).strip()
         return prompt
 
+    async def _fetch_issue_thread_context(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        installation_id: int,
+        exclude_comment_id: int | None = None,
+    ) -> str:
+        """Fetch issue/PR comment history and format as context for the agent prompt.
+
+        Args:
+            owner: Repo owner
+            repo: Repo name
+            issue_number: Issue or PR number
+            installation_id: GitHub App installation ID
+            exclude_comment_id: Comment ID to exclude (the triggering comment)
+
+        Returns:
+            Formatted comment history string, or empty string if no history.
+        """
+        try:
+            comments = await self._api.get_issue_comments(
+                owner, repo, issue_number, installation_id
+            )
+        except Exception:
+            logger.warning("Failed to fetch issue comment history", exc_info=True)
+            return ""
+
+        if not comments:
+            return ""
+
+        # Exclude the triggering comment to avoid duplicating it in the prompt
+        if exclude_comment_id:
+            comments = [c for c in comments if c.get("id") != exclude_comment_id]
+
+        if not comments:
+            return ""
+
+        # Format each comment (truncate long ones)
+        max_comment_length = 2000
+        lines = []
+        for comment in comments:
+            user = comment.get("user", {})
+            login = user.get("login", "unknown")
+            body = comment.get("body", "")
+            if len(body) > max_comment_length:
+                body = body[:max_comment_length] + "\n...(truncated)"
+            lines.append(f"@{login}:\n{body}")
+
+        if not lines:
+            return ""
+
+        context = "\n\n".join(lines)
+
+        # Cap total length to avoid overwhelming the prompt
+        max_context_length = 20_000
+        if len(context) > max_context_length:
+            context = "...(earlier comments trimmed)...\n\n" + context[-max_context_length:]
+
+        return "Here is the comment history from this GitHub thread:\n\n" + context + "\n\n---\n\n"
+
     async def _handle_issue_opened(self, payload: IssuesPayload) -> None:
         """Handle an issues event with action 'opened'."""
         issue = payload.issue
@@ -187,7 +261,10 @@ class GitHubAdapter:
 
         owner, repo_name = repo.full_name.split("/", 1)
         issue_number = issue.number
-        session_id = f"github:{repo.full_name}:{issue_number}"
+        if self._agent_name:
+            session_id = f"github:{repo.full_name}:{issue_number}:{self._agent_name}"
+        else:
+            session_id = f"github:{repo.full_name}:{issue_number}"
 
         logger.info(
             "GitHub @mention in new issue body: session=%s, user=%s",
@@ -236,8 +313,9 @@ class GitHubAdapter:
 
         request = BridgeSessionRequest(
             external_session_id=session_id,
-            service_name=self.service_name,
+            service_name="github",
             prompt=full_prompt,
+            agent_name=self._agent_name,
             descriptive_name=slugify(issue.title),
             service_metadata=session_data,
         )
@@ -269,7 +347,10 @@ class GitHubAdapter:
 
         owner, repo_name = repo.full_name.split("/", 1)
         issue_number = payload.issue.number
-        session_id = f"github:{repo.full_name}:{issue_number}"
+        if self._agent_name:
+            session_id = f"github:{repo.full_name}:{issue_number}:{self._agent_name}"
+        else:
+            session_id = f"github:{repo.full_name}:{issue_number}"
 
         logger.info(
             "GitHub @mention in issue comment: session=%s, user=%s",
@@ -290,6 +371,15 @@ class GitHubAdapter:
             logger.exception("Failed to post initial progress comment for %s", session_id)
             return
 
+        # Fetch comment history for thread context
+        thread_context = await self._fetch_issue_thread_context(
+            owner,
+            repo_name,
+            issue_number,
+            installation_id,
+            exclude_comment_id=comment.id,
+        )
+
         # Check if this is a follow-up on an active issue
         if session_id in self._active_issues:
             if session_id in self._sessions:
@@ -299,7 +389,7 @@ class GitHubAdapter:
                 self._sessions[session_id]["trigger_comment_id"] = comment.id
                 self._sessions[session_id]["progress_comment_id"] = progress_comment_id
                 self._sessions[session_id]["current_text"] = "_Thinking..._"
-                await self._session_manager.handle_followup(session_id, prompt)
+                await self._session_manager.handle_followup(session_id, thread_context + prompt)
                 return
             else:
                 # Session completed but issue still active — start new session
@@ -307,9 +397,10 @@ class GitHubAdapter:
 
         # Build prompt with issue context
         issue = payload.issue
-        context_parts = [
-            f"GitHub issue: {issue.title} (#{issue.number})",
-        ]
+        context_parts = []
+        if thread_context:
+            context_parts.append(thread_context)
+        context_parts.append(f"GitHub issue: {issue.title} (#{issue.number})")
         if issue.body:
             context_parts.append(f"Issue body:\n{issue.body}")
         context_parts.append(f"User @{comment.user.login} commented:\n{prompt}")
@@ -333,8 +424,9 @@ class GitHubAdapter:
 
         request = BridgeSessionRequest(
             external_session_id=session_id,
-            service_name=self.service_name,
+            service_name="github",
             prompt=full_prompt,
+            agent_name=self._agent_name,
             descriptive_name=slugify(issue.title),
             service_metadata=session_data,
         )
@@ -366,7 +458,10 @@ class GitHubAdapter:
 
         owner, repo_name = repo.full_name.split("/", 1)
         pr_number = payload.pull_request.number
-        session_id = f"github:{repo.full_name}:{pr_number}"
+        if self._agent_name:
+            session_id = f"github:{repo.full_name}:{pr_number}:{self._agent_name}"
+        else:
+            session_id = f"github:{repo.full_name}:{pr_number}"
 
         logger.info(
             "GitHub @mention in PR review comment: session=%s, user=%s",
@@ -394,6 +489,14 @@ class GitHubAdapter:
             logger.exception("Failed to post initial review comment reply for %s", session_id)
             return
 
+        # Fetch issue-level comment history for thread context
+        thread_context = await self._fetch_issue_thread_context(
+            owner,
+            repo_name,
+            pr_number,
+            installation_id,
+        )
+
         # Check if this is a follow-up on an active PR
         if session_id in self._active_issues:
             if session_id in self._sessions:
@@ -403,16 +506,17 @@ class GitHubAdapter:
                 self._sessions[session_id]["progress_comment_id"] = progress_comment_id
                 self._sessions[session_id]["current_text"] = "_Thinking..._"
                 self._sessions[session_id]["is_review_comment"] = True
-                await self._session_manager.handle_followup(session_id, prompt)
+                await self._session_manager.handle_followup(session_id, thread_context + prompt)
                 return
             else:
                 logger.info("Creating new session for continued PR conversation %s", session_id)
 
         # Build prompt with PR + diff context
         pr = payload.pull_request
-        context_parts = [
-            f"Pull request: {pr.title} (#{pr.number})",
-        ]
+        context_parts = []
+        if thread_context:
+            context_parts.append(thread_context)
+        context_parts.append(f"Pull request: {pr.title} (#{pr.number})")
         if pr.body:
             context_parts.append(f"PR description:\n{pr.body}")
         if comment.path:
@@ -442,8 +546,9 @@ class GitHubAdapter:
 
         request = BridgeSessionRequest(
             external_session_id=session_id,
-            service_name=self.service_name,
+            service_name="github",
             prompt=full_prompt,
+            agent_name=self._agent_name,
             descriptive_name=slugify(pr.title),
             service_metadata=session_data,
         )

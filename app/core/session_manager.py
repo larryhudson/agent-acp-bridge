@@ -33,6 +33,7 @@ class ActiveSession:
     acp_session_id: str  # The actual ACP session ID for resumption
     cwd: str  # Working directory for this session
     branch_name: str = ""  # Git branch for this session
+    agent_name: str = ""  # Which agent is running this session
     service_metadata: dict[str, Any] | None = None  # Adapter-specific state
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,6 +44,7 @@ class ActiveSession:
             "acp_session_id": self.acp_session_id,
             "cwd": self.cwd,
             "branch_name": self.branch_name,
+            "agent_name": self.agent_name,
         }
         if self.service_metadata:
             data["service_metadata"] = self.service_metadata
@@ -60,6 +62,7 @@ class ActiveSession:
             acp_session_id=data["acp_session_id"],
             cwd=data["cwd"],
             branch_name=data.get("branch_name", ""),
+            agent_name=data.get("agent_name", ""),
             service_metadata=data.get("service_metadata"),
         )
 
@@ -154,9 +157,15 @@ class SessionManager:
             BridgeUpdate(type="thought", content="Starting work..."),
         )
 
+        # Resolve agent name early — needed for both repo prep and ACP session
+        agent_name = request.agent_name or settings.default_agent_name
+        agent_config = settings.get_agent_config(agent_name)
+
         # Prepare the repo: clone/fetch, create branch, install skill files
         try:
-            repo_session = await self._repo_provider.prepare_new_session(request.descriptive_name)
+            repo_session = await self._repo_provider.prepare_new_session(
+                request.descriptive_name, agent_name=agent_name
+            )
         except Exception:
             logger.exception("Failed to prepare repo for %s", external_id)
             await adapter.send_error(external_id, "Failed to prepare repository")
@@ -164,10 +173,8 @@ class SessionManager:
 
         # Create update router for this session
         router = UpdateRouter(adapter, external_id)
-
-        # Spawn ACP session
         acp_session = AcpSession(
-            command=settings.acp_agent_command,
+            command=agent_config.command,
             on_update=router.handle_update,
             env=repo_session.env or None,
         )
@@ -189,6 +196,7 @@ class SessionManager:
             acp_session_id=acp_session_id,
             cwd=repo_session.cwd,
             branch_name=repo_session.branch_name,
+            agent_name=agent_name,
             service_metadata=request.service_metadata,
         )
         self._active_sessions[external_id] = active
@@ -252,30 +260,34 @@ class SessionManager:
 
         # Prepare the repo for resumption (fetch, checkout branch, refresh tokens)
         env: dict[str, str] | None = None
+        agent_name = active.agent_name
         if active.branch_name:
             try:
-                repo_session = await self._repo_provider.prepare_resume_session(active.branch_name)
+                repo_session = await self._repo_provider.prepare_resume_session(
+                    active.branch_name, agent_name=agent_name
+                )
                 env = repo_session.env or None
             except Exception:
                 logger.exception("Failed to prepare repo for follow-up %s", external_session_id)
                 # Fall back to just refreshing tokens
                 try:
-                    fresh_env = await self._repo_provider.build_agent_env()
+                    fresh_env = await self._repo_provider.build_agent_env(agent_name)
                     env = fresh_env or None
                 except Exception:
                     logger.exception("Failed to build agent env for %s", external_session_id)
         else:
             # No branch (legacy session) — just refresh tokens
             try:
-                fresh_env = await self._repo_provider.build_agent_env()
+                fresh_env = await self._repo_provider.build_agent_env(agent_name)
                 env = fresh_env or None
             except Exception:
                 logger.exception("Failed to build agent env for %s", external_session_id)
 
         # Create a new ACP subprocess and RESUME the session with full history
         router = UpdateRouter(adapter, external_session_id)
+        agent_config = settings.get_agent_config(active.agent_name)
         acp_session = AcpSession(
-            command=settings.acp_agent_command,
+            command=agent_config.command,
             on_update=router.handle_update,
             env=env,
         )
@@ -334,8 +346,14 @@ class SessionManager:
             return
 
         restored_count = 0
+        # Match adapter to sessions: exact match or legacy match (e.g. "slack" matches "slack:default")
+        adapter_service_type = adapter.service_name.split(":")[0]
         for external_id, metadata in self._persisted_metadata.items():
-            if metadata["service_name"] == adapter.service_name:
+            session_service = metadata["service_name"]
+            if session_service == adapter.service_name or (
+                session_service == adapter_service_type
+                and metadata.get("agent_name", "") in ("", adapter.service_name.split(":")[-1])
+            ):
                 # Skip if already active (shouldn't happen, but be defensive)
                 if external_id in self._active_sessions:
                     continue
@@ -350,6 +368,7 @@ class SessionManager:
                     acp_session_id=metadata["acp_session_id"],
                     cwd=metadata["cwd"],
                     branch_name=metadata.get("branch_name", ""),
+                    agent_name=metadata.get("agent_name", ""),
                     service_metadata=metadata.get(
                         "service_metadata"
                     ),  # Restore adapter-specific state

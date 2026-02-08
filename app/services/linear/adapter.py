@@ -27,11 +27,20 @@ class LinearAdapter:
     - Session lifecycle management
     """
 
-    service_name: str = "linear"
-
-    def __init__(self, session_manager: Any) -> None:
+    def __init__(
+        self,
+        session_manager: Any,
+        agent_name: str = "",
+        access_token: str = "",
+        webhook_secret: str = "",
+        route_path: str = "/webhooks/linear",
+    ) -> None:
         self._session_manager = session_manager
-        self._api = LinearApiClient(settings.linear_access_token)
+        self._agent_name = agent_name
+        self.service_name: str = f"linear:{agent_name}" if agent_name else "linear"
+        self._api = LinearApiClient(access_token or settings.linear_access_token)
+        self._webhook_secret = webhook_secret or settings.linear_webhook_secret
+        self._route_path = route_path
         # Track accumulated message text per session for final response
         self._message_buffers: dict[str, str] = {}
         # Keep references to background tasks so they aren't garbage collected
@@ -44,14 +53,14 @@ class LinearAdapter:
     def register_routes(self, app: FastAPI) -> None:
         """Register the Linear webhook endpoint."""
 
-        @app.post("/webhooks/linear")
+        @app.post(self._route_path)
         async def handle_linear_webhook(request: Request) -> Response:
             raw_body = await request.body()
 
             # Verify signature
             signature = request.headers.get("Linear-Signature", "")
-            if settings.linear_webhook_secret and not verify_signature(
-                raw_body, signature, settings.linear_webhook_secret
+            if self._webhook_secret and not verify_signature(
+                raw_body, signature, self._webhook_secret
             ):
                 logger.warning("Invalid webhook signature")
                 return Response(status_code=400)
@@ -101,6 +110,7 @@ class LinearAdapter:
             external_session_id=session_id,
             service_name=self.service_name,
             prompt=prompt,
+            agent_name=self._agent_name,
             descriptive_name=slugify(issue_title) if issue_title else "linear-task",
         )
 

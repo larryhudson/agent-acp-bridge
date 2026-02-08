@@ -43,6 +43,7 @@ class AcpSession:
         self._conn: ClientSideConnection | None = None
         self._client: BridgeAcpClient | None = None
         self._session_id: str | None = None
+        self._supports_load_session: bool = False
 
     @property
     def session_id(self) -> str | None:
@@ -76,7 +77,7 @@ class AcpSession:
         self._client = BridgeAcpClient(on_update=self._on_update)
         self._conn = connect_to_agent(self._client, self._proc.stdin, self._proc.stdout)
 
-        await self._conn.initialize(
+        init_response = await self._conn.initialize(
             protocol_version=PROTOCOL_VERSION,
             client_capabilities=ClientCapabilities(),
             client_info=Implementation(
@@ -86,13 +87,27 @@ class AcpSession:
             ),
         )
 
+        # Check if agent supports session/load (codex-acp) vs session/resume (claude-code-acp)
+        caps = init_response.agent_capabilities
+        if caps and caps.load_session:
+            self._supports_load_session = True
+
         if resume_session_id:
             # Resume existing session with full conversation history
-            session = await self._conn.resume_session(
-                session_id=resume_session_id,
-                cwd=cwd,
-                mcp_servers=[],
-            )
+            if self._supports_load_session:
+                # codex-acp uses session/load
+                await self._conn.load_session(
+                    session_id=resume_session_id,
+                    cwd=cwd,
+                    mcp_servers=[],
+                )
+            else:
+                # claude-code-acp uses session/resume
+                await self._conn.resume_session(
+                    session_id=resume_session_id,
+                    cwd=cwd,
+                    mcp_servers=[],
+                )
             self._session_id = resume_session_id
             logger.info("ACP session resumed: %s (cwd=%s)", self._session_id, cwd)
         else:

@@ -154,6 +154,63 @@ class SlackApiClient:
             if error != "already_reacted":
                 logger.warning("Failed to add reaction: %s", error)
 
+    async def get_thread_replies(
+        self,
+        channel: str,
+        thread_ts: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get messages in a thread using conversations.replies.
+
+        Args:
+            channel: Channel ID
+            thread_ts: Parent message timestamp
+            limit: Max messages to return
+
+        Returns:
+            List of message dicts (includes parent message as first element)
+        """
+        response = await self._client.get(
+            "/conversations.replies",
+            params={"channel": channel, "ts": thread_ts, "limit": limit},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            error = data.get("error", "unknown")
+            logger.warning("Failed to get thread replies: %s", error)
+            return []
+        return data.get("messages", [])
+
+    async def get_user_info(self, user_id: str) -> dict[str, Any]:
+        """Get user profile info.
+
+        Args:
+            user_id: Slack user ID (e.g., U01234567)
+
+        Returns:
+            User info dict with name, real_name, etc.
+        """
+        response = await self._client.get(
+            "/users.info",
+            params={"user": user_id},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            return {}
+        return data.get("user", {})
+
+    async def auth_test(self) -> dict[str, Any]:
+        """Call auth.test to get bot identity info (user_id, bot_id, etc.)."""
+        response = await self._client.post("/auth.test")
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            error = data.get("error", "unknown")
+            raise RuntimeError(f"auth.test failed: {error}")
+        return data
+
     async def close(self) -> None:
         """Close the HTTP client."""
         await self._client.aclose()

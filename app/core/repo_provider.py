@@ -55,20 +55,23 @@ class RepoProvider:
     def __init__(
         self,
         auth: GitHubAuth | None = None,
+        auth_map: dict[str, GitHubAuth] | None = None,
         enabled_services: list[str] | None = None,
     ) -> None:
-        self._auth = auth
+        self._auth = auth  # Default auth for repo operations (clone/fetch)
+        self._auth_map = auth_map or {}  # Per-agent auth for GH_TOKEN generation
         self._enabled_services = enabled_services or settings.enabled_services_list
         self._lock = asyncio.Lock()
         self._repo_path = (
             Path("/data/projects") / settings.github_repo if settings.github_repo else None
         )
 
-    async def prepare_new_session(self, descriptive_name: str) -> RepoSession:
+    async def prepare_new_session(self, descriptive_name: str, agent_name: str = "") -> RepoSession:
         """Clone/fetch the repo and create a new branch for this session.
 
         Args:
             descriptive_name: Human-readable name for the branch (e.g. issue title).
+            agent_name: Which agent this session is for (for per-agent GH_TOKEN).
 
         Returns:
             RepoSession with cwd, branch_name, and env.
@@ -90,14 +93,15 @@ class RepoProvider:
             # Install skill files
             self._install_skill_files()
 
-            env = await self.build_agent_env()
+            env = await self.build_agent_env(agent_name)
             return RepoSession(cwd=str(repo_path), branch_name=branch_name, env=env)
 
-    async def prepare_resume_session(self, branch_name: str) -> RepoSession:
+    async def prepare_resume_session(self, branch_name: str, agent_name: str = "") -> RepoSession:
         """Fetch latest and checkout an existing branch for a follow-up session.
 
         Args:
             branch_name: The branch created by prepare_new_session.
+            agent_name: Which agent this session is for (for per-agent GH_TOKEN).
 
         Returns:
             RepoSession with cwd, branch_name, and refreshed env.
@@ -113,13 +117,14 @@ class RepoProvider:
             # Re-install skill files (in case they were cleaned or updated)
             self._install_skill_files()
 
-            env = await self.build_agent_env()
+            env = await self.build_agent_env(agent_name)
             return RepoSession(cwd=str(repo_path), branch_name=branch_name, env=env)
 
-    async def build_agent_env(self) -> dict[str, str]:
+    async def build_agent_env(self, agent_name: str = "") -> dict[str, str]:
         """Build environment variables for the agent subprocess.
 
         Forwards API keys and generates fresh tokens for enabled services.
+        Uses agent-specific GitHub auth/installation when available.
         """
         env: dict[str, str] = {}
 
@@ -128,15 +133,30 @@ class RepoProvider:
         if settings.openai_api_key:
             env["OPENAI_API_KEY"] = settings.openai_api_key
 
-        # GitHub token (fresh installation token)
-        if "github" in self._enabled_services and self._auth is not None:
-            try:
-                installation_id = settings.github_installation_id
-                if installation_id:
-                    token = await self._auth.get_installation_token(installation_id)
-                    env["GH_TOKEN"] = token
-            except Exception:
-                logger.exception("Failed to get GitHub installation token for agent env")
+        # GitHub token — use agent-specific auth + installation ID if available
+        if "github" in self._enabled_services:
+            auth = self._auth_map.get(agent_name, self._auth) if agent_name else self._auth
+            if auth is not None:
+                try:
+                    # Look up agent-specific installation ID, fall back to default
+                    installation_id_str = (
+                        settings.get_service_credential("GITHUB_INSTALLATION_ID", agent_name)
+                        if agent_name
+                        else ""
+                    )
+                    installation_id = (
+                        int(installation_id_str)
+                        if installation_id_str
+                        else settings.github_installation_id
+                    )
+                    if installation_id:
+                        token = await auth.get_installation_token(installation_id)
+                        env["GH_TOKEN"] = token
+                except Exception:
+                    logger.exception(
+                        "Failed to get GitHub installation token for agent env (agent=%s)",
+                        agent_name,
+                    )
 
         # Slack tokens
         if "slack" in self._enabled_services and settings.slack_bot_token:
@@ -224,9 +244,10 @@ class RepoProvider:
             return
 
         # Target directories (global agent skill dirs, not inside the repo)
+        home = Path.home()
         targets = [
-            Path("/root/.claude/skills"),
-            Path("/root/.codex/skills"),
+            home / ".claude" / "skills",
+            home / ".codex" / "skills",
         ]
 
         for service in self._enabled_services:

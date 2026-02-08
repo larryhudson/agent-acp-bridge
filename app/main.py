@@ -23,26 +23,86 @@ _adapters: list[ServiceAdapter] = []
 
 def _create_adapters(
     session_manager: SessionManager,
-    github_auth: GitHubAuth | None = None,
+    github_auth_map: dict[str, GitHubAuth] | None = None,
 ) -> list[ServiceAdapter]:
-    """Instantiate adapters for all enabled services."""
+    """Instantiate adapters for all enabled services, one per agent.
+
+    For each agent in the registry, creates adapter instances for each
+    enabled service with agent-specific credentials.
+    """
     adapters: list[ServiceAdapter] = []
+    github_auth_map = github_auth_map or {}
 
-    for service in settings.enabled_services_list:
-        if service == "linear":
-            from app.services.linear.adapter import LinearAdapter
+    for agent_name, agent_config in settings.agents.items():
+        is_default = agent_config.default
 
-            adapters.append(LinearAdapter(session_manager))
-        elif service == "slack":
-            from app.services.slack.adapter import SlackAdapter
+        for service in settings.enabled_services_list:
+            if service == "slack":
+                from app.services.slack.adapter import SlackAdapter
 
-            adapters.append(SlackAdapter(session_manager))
-        elif service == "github":
-            from app.services.github.adapter import GitHubAdapter
+                bot_token = settings.get_service_credential("SLACK_BOT_TOKEN", agent_name)
+                app_token = settings.get_service_credential("SLACK_APP_TOKEN", agent_name)
+                if bot_token and app_token:
+                    adapters.append(
+                        SlackAdapter(
+                            session_manager,
+                            agent_name=agent_name,
+                            bot_token=bot_token,
+                            app_token=app_token,
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "Slack tokens missing for agent %s — skipping Slack adapter",
+                        agent_name,
+                    )
 
-            adapters.append(GitHubAdapter(session_manager, auth=github_auth))
-        else:
-            logger.warning("Unknown service: %s (skipping)", service)
+            elif service == "github":
+                from app.services.github.adapter import GitHubAdapter
+
+                webhook_secret = settings.get_service_credential(
+                    "GITHUB_WEBHOOK_SECRET", agent_name
+                )
+                bot_login = settings.get_service_credential("GITHUB_BOT_LOGIN", agent_name)
+                route_path = "/webhooks/github" if is_default else f"/webhooks/github/{agent_name}"
+                github_auth = github_auth_map.get(agent_name)
+                adapters.append(
+                    GitHubAdapter(
+                        session_manager,
+                        agent_name=agent_name,
+                        webhook_secret=webhook_secret,
+                        route_path=route_path,
+                        auth=github_auth,
+                        bot_login=bot_login,
+                    )
+                )
+
+            elif service == "linear":
+                from app.services.linear.adapter import LinearAdapter
+
+                access_token = settings.get_service_credential("LINEAR_ACCESS_TOKEN", agent_name)
+                webhook_secret = settings.get_service_credential(
+                    "LINEAR_WEBHOOK_SECRET", agent_name
+                )
+                route_path = "/webhooks/linear" if is_default else f"/webhooks/linear/{agent_name}"
+                if access_token:
+                    adapters.append(
+                        LinearAdapter(
+                            session_manager,
+                            agent_name=agent_name,
+                            access_token=access_token,
+                            webhook_secret=webhook_secret,
+                            route_path=route_path,
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "Linear access token missing for agent %s — skipping",
+                        agent_name,
+                    )
+
+            else:
+                logger.warning("Unknown service: %s (skipping)", service)
 
     return adapters
 
@@ -57,19 +117,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Create shared GitHub auth if a repo is configured
-    github_auth: GitHubAuth | None = None
-    if settings.github_repo and settings.github_app_id:
-        github_auth = GitHubAuth()
+    # Build per-agent GitHub auth instances
+    github_auth_map: dict[str, GitHubAuth] = {}
+    default_github_auth: GitHubAuth | None = None
+    if settings.github_repo:
+        for agent_name, _agent_cfg in settings.agents.items():
+            app_id = settings.get_service_credential("GITHUB_APP_ID", agent_name)
+            private_key = settings.get_service_credential("GITHUB_PRIVATE_KEY", agent_name)
+            if app_id and private_key:
+                auth = GitHubAuth(app_id=app_id, private_key=private_key)
+                github_auth_map[agent_name] = auth
+                if default_github_auth is None:
+                    default_github_auth = auth
 
-    # Create shared RepoProvider
+    # Create shared RepoProvider (default auth for clone/fetch, auth_map for per-agent GH_TOKEN)
     repo_provider = RepoProvider(
-        auth=github_auth,
+        auth=default_github_auth,
+        auth_map=github_auth_map,
         enabled_services=settings.enabled_services_list,
     )
 
     _session_manager = SessionManager(repo_provider=repo_provider)
-    _adapters = _create_adapters(_session_manager, github_auth=github_auth)
+    _adapters = _create_adapters(_session_manager, github_auth_map=github_auth_map)
 
     # Register routes and start each adapter
     for adapter in _adapters:
@@ -94,8 +163,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     for adapter in _adapters:
         await adapter.close()
 
-    if github_auth is not None:
-        await github_auth.close()
+    for auth in github_auth_map.values():
+        await auth.close()
 
     _session_manager = None
     _adapters = []

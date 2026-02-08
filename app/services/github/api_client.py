@@ -155,6 +155,27 @@ class GitHubApiClient:
                 response.text,
             )
 
+    async def get_issue_comments(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        installation_id: int,
+        per_page: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List comments on an issue or PR.
+
+        GET /repos/{owner}/{repo}/issues/{issue_number}/comments
+        """
+        headers = await self._headers(installation_id)
+        response = await self._client.get(
+            f"/repos/{owner}/{repo}/issues/{issue_number}/comments",
+            headers=headers,
+            params={"per_page": per_page},
+        )
+        response.raise_for_status()
+        return response.json()
+
     async def create_issue_reaction(
         self,
         owner: str,

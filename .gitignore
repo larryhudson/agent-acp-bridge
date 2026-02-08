@@ -39,6 +39,10 @@ ehthumbs.db
 .claude/hooks/lsp-bridge.socket
 .claude/hooks/lsp-bridge.log
 
+# Agent skill files and config (written by claude-code/codex agents)
+.claude/skills/
+.codex/
+
 # Session persistence and project data
 data/
 

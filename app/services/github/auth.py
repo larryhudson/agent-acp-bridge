@@ -30,7 +30,9 @@ class InstallationToken:
 class GitHubAuth:
     """Manages GitHub App JWT generation and installation token caching."""
 
-    def __init__(self) -> None:
+    def __init__(self, app_id: str = "", private_key: str = "") -> None:
+        self._app_id = app_id or settings.github_app_id
+        self._private_key = private_key or settings.github_private_key
         self._token_cache: dict[int, InstallationToken] = {}
         self._client = httpx.AsyncClient(
             base_url="https://api.github.com",
@@ -39,17 +41,22 @@ class GitHubAuth:
         )
         self._app_slug: str | None = None
 
+    @property
+    def _private_key_bytes(self) -> bytes:
+        """Convert the PEM key string (with escaped newlines) to bytes."""
+        return self._private_key.replace("\\n", "\n").encode("utf-8")
+
     def _generate_jwt(self) -> str:
         """Generate a JWT signed with the App's private key (RS256, 9-minute expiry)."""
         now = int(time.time())
         payload = {
             "iat": now - 60,  # Issued 60s ago to account for clock drift
             "exp": now + 540,  # 9 minutes
-            "iss": settings.github_app_id,
+            "iss": self._app_id,
         }
         return jwt.encode(
             payload,
-            settings.github_private_key_bytes,
+            self._private_key_bytes,
             algorithm="RS256",
         )
 
