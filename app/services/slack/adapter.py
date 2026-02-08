@@ -95,6 +95,24 @@ class SlackAdapter:
                     return
                 raise
 
+    async def _post_fallback_message(self, session_data: dict[str, Any], text: str) -> bool:
+        channel = session_data["channel"]
+        thread_ts = session_data.get("thread_ts")
+        truncated = _truncate_for_slack(text, max_bytes=SLACK_RETRY_MAX_MESSAGE_BYTES)
+
+        try:
+            response = await self._api.post_message(
+                channel=channel,
+                text=truncated,
+                thread_ts=thread_ts,
+            )
+            session_data["progress_message_ts"] = response["ts"]
+            session_data["current_text"] = truncated
+            return True
+        except Exception:
+            logger.exception("Failed to post fallback progress message for %s", channel)
+            return False
+
     def register_routes(self, app: FastAPI) -> None:
         """No routes needed for Socket Mode (implements ServiceAdapter.register_routes)."""
         pass
@@ -456,7 +474,9 @@ class SlackAdapter:
                 # Show current thought
                 new_text = f"💭 {update.content}"
                 new_text = _truncate_for_slack(new_text)
-                await self._safe_update_message(channel, ts, new_text)
+                update_ok = await self._safe_update_message(channel, ts, new_text)
+                if not update_ok:
+                    await self._post_fallback_message(session_data, new_text)
                 session_data["current_text"] = new_text
 
             elif update.type == "tool_call":
@@ -494,7 +514,9 @@ class SlackAdapter:
                     plan_text += f"{icon} {content}\n"
 
                 plan_text = _truncate_for_slack(plan_text)
-                await self._safe_update_message(channel, ts, plan_text)
+                update_ok = await self._safe_update_message(channel, ts, plan_text)
+                if not update_ok:
+                    await self._post_fallback_message(session_data, plan_text)
                 session_data["current_text"] = plan_text
 
         except Exception:
@@ -530,7 +552,9 @@ class SlackAdapter:
             original_ts = session_data["original_ts"]
 
             # Update progress message with final response
-            await self._safe_update_message(channel, progress_ts, final_text)
+            update_ok = await self._safe_update_message(channel, progress_ts, final_text)
+            if not update_ok:
+                await self._post_fallback_message(session_data, final_text)
 
             # Add checkmark reaction to original mention
             await self._api.add_reaction(channel, original_ts, "white_check_mark")
@@ -562,7 +586,9 @@ class SlackAdapter:
 
             # Update progress message with error
             error_text = f"❌ Error: {error}"
-            await self._safe_update_message(channel, progress_ts, error_text)
+            update_ok = await self._safe_update_message(channel, progress_ts, error_text)
+            if not update_ok:
+                await self._post_fallback_message(session_data, error_text)
 
             # Add X reaction to original mention
             await self._api.add_reaction(channel, original_ts, "x")
