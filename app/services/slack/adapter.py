@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from app.config import settings
 from app.core.repo_provider import slugify
 from app.core.types import BridgeSessionRequest, BridgeUpdate
 from app.services.slack.api_client import SlackApiClient
