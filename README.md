@@ -36,12 +36,12 @@ Each service adapter implements a common `ServiceAdapter` protocol, so the bridg
 Sessions work on GitHub repositories with concurrent isolation via git worktrees. When a new session starts, the bridge:
 
 1. Clones or fetches the repo to `/data/projects/<owner>/<repo>/` (bare repository)
-2. Creates a unique branch: `acp-agent/<slug>-<timestamp>` (or `acp-<agentname>/<slug>-<timestamp>` in multi-agent mode)
-3. Creates an isolated worktree at `/data/worktrees/<owner>/<repo>/<session-id>/` for the session
+2. Creates a unique branch: `acp-agent/<slug>-<timestamp>`
+3. Creates an isolated worktree at `/data/worktrees/<owner>/<repo>/<slug>-<timestamp>/` for the session
 4. Installs skill files (service-specific instructions) for the agent
 5. Forwards API tokens so the agent can interact with GitHub, Slack, and Linear
 
-Each session operates in its own worktree, enabling multiple agents to work concurrently on different branches without conflicts. Follow-up messages resume the same session on the same branch with full conversation history. Worktrees are cleaned up automatically when sessions complete.
+Each session operates in its own worktree, enabling multiple agents to work concurrently on different branches without conflicts. Follow-up messages resume the same session on the same branch with full conversation history.
 
 ## Setup
 
@@ -121,7 +121,7 @@ SLACK_BOT_TOKEN=xoxb-default-token
 SLACK_BOT_TOKEN__CODEX=xoxb-codex-token
 ```
 
-When `AGENTS_JSON` is set, users can interact with different agents in the same channels/issues by mentioning them (e.g., `@claude-bot` vs `@codex-bot` in Slack). Session IDs include the agent name to maintain separate conversation contexts.
+When `AGENTS_JSON` is set, users can interact with different agents in the same channels/issues by mentioning them (e.g., `@claude-bot` vs `@codex-bot` in Slack). For Slack and GitHub sessions, session IDs include the agent name to maintain separate conversation contexts.
 
 ### Slack channel-specific configuration
 
