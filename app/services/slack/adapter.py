@@ -20,15 +20,16 @@ logger = logging.getLogger(__name__)
 # Slack's message limit is ~40k characters; use a conservative threshold.
 SLACK_MAX_MESSAGE_LENGTH = 30_000
 SLACK_TRUNCATION_NOTICE = "\n\n_(message truncated — too long for Slack)_"
+SLACK_RETRY_MAX_MESSAGE_LENGTH = 10_000
 
 
-def _truncate_for_slack(text: str) -> str:
-    if len(text) <= SLACK_MAX_MESSAGE_LENGTH:
+def _truncate_for_slack(text: str, max_length: int = SLACK_MAX_MESSAGE_LENGTH) -> str:
+    if len(text) <= max_length:
         return text
 
-    max_len = SLACK_MAX_MESSAGE_LENGTH - len(SLACK_TRUNCATION_NOTICE)
+    max_len = max_length - len(SLACK_TRUNCATION_NOTICE)
     if max_len <= 0:
-        return SLACK_TRUNCATION_NOTICE[:SLACK_MAX_MESSAGE_LENGTH]
+        return SLACK_TRUNCATION_NOTICE[:max_length]
 
     return text[:max_len] + SLACK_TRUNCATION_NOTICE
 
@@ -71,6 +72,17 @@ class SlackAdapter:
         self._active_threads: set[tuple[str, str]] = set()
         # Cache user display names to avoid repeated API calls
         self._user_name_cache: dict[str, str] = {}
+
+    async def _safe_update_message(self, channel: str, ts: str, text: str) -> None:
+        try:
+            await self._api.update_message(channel, ts, text)
+        except RuntimeError as exc:
+            if "msg_too_long" not in str(exc):
+                raise
+
+            logger.warning("Slack msg_too_long for %s:%s; retrying with shorter text", channel, ts)
+            truncated = _truncate_for_slack(text, max_length=SLACK_RETRY_MAX_MESSAGE_LENGTH)
+            await self._api.update_message(channel, ts, truncated)
 
     def register_routes(self, app: FastAPI) -> None:
         """No routes needed for Socket Mode (implements ServiceAdapter.register_routes)."""
@@ -433,7 +445,7 @@ class SlackAdapter:
                 # Show current thought
                 new_text = f"💭 {update.content}"
                 new_text = _truncate_for_slack(new_text)
-                await self._api.update_message(channel, ts, new_text)
+                await self._safe_update_message(channel, ts, new_text)
                 session_data["current_text"] = new_text
 
             elif update.type == "tool_call":
@@ -448,7 +460,7 @@ class SlackAdapter:
                         lines.pop(0)
                     new_text = "_(earlier tool calls trimmed)_\n" + "\n".join(lines)
                 new_text = _truncate_for_slack(new_text)
-                await self._api.update_message(channel, ts, new_text)
+                await self._safe_update_message(channel, ts, new_text)
                 session_data["current_text"] = new_text
 
             elif update.type == "message_chunk":
@@ -471,7 +483,7 @@ class SlackAdapter:
                     plan_text += f"{icon} {content}\n"
 
                 plan_text = _truncate_for_slack(plan_text)
-                await self._api.update_message(channel, ts, plan_text)
+                await self._safe_update_message(channel, ts, plan_text)
                 session_data["current_text"] = plan_text
 
         except Exception:
@@ -507,7 +519,7 @@ class SlackAdapter:
             original_ts = session_data["original_ts"]
 
             # Update progress message with final response
-            await self._api.update_message(channel, progress_ts, final_text)
+            await self._safe_update_message(channel, progress_ts, final_text)
 
             # Add checkmark reaction to original mention
             await self._api.add_reaction(channel, original_ts, "white_check_mark")
@@ -539,7 +551,7 @@ class SlackAdapter:
 
             # Update progress message with error
             error_text = f"❌ Error: {error}"
-            await self._api.update_message(channel, progress_ts, error_text)
+            await self._safe_update_message(channel, progress_ts, error_text)
 
             # Add X reaction to original mention
             await self._api.add_reaction(channel, original_ts, "x")
