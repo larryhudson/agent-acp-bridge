@@ -20,18 +20,22 @@ logger = logging.getLogger(__name__)
 # Slack's message limit is ~40k characters; use a conservative threshold.
 SLACK_MAX_MESSAGE_LENGTH = 30_000
 SLACK_TRUNCATION_NOTICE = "\n\n_(message truncated — too long for Slack)_"
-SLACK_RETRY_MAX_MESSAGE_LENGTH = 10_000
+SLACK_MAX_MESSAGE_BYTES = 30_000
+SLACK_RETRY_MAX_MESSAGE_BYTES = 8_000
 
 
-def _truncate_for_slack(text: str, max_length: int = SLACK_MAX_MESSAGE_LENGTH) -> str:
-    if len(text) <= max_length:
+def _truncate_for_slack(text: str, max_bytes: int = SLACK_MAX_MESSAGE_BYTES) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
         return text
 
-    max_len = max_length - len(SLACK_TRUNCATION_NOTICE)
-    if max_len <= 0:
-        return SLACK_TRUNCATION_NOTICE[:max_length]
+    notice = SLACK_TRUNCATION_NOTICE.encode("utf-8")
+    max_body_bytes = max_bytes - len(notice)
+    if max_body_bytes <= 0:
+        return notice[:max_bytes].decode("utf-8", errors="ignore")
 
-    return text[:max_len] + SLACK_TRUNCATION_NOTICE
+    truncated = encoded[:max_body_bytes].decode("utf-8", errors="ignore")
+    return truncated + SLACK_TRUNCATION_NOTICE
 
 
 class SlackAdapter:
@@ -81,8 +85,14 @@ class SlackAdapter:
                 raise
 
             logger.warning("Slack msg_too_long for %s:%s; retrying with shorter text", channel, ts)
-            truncated = _truncate_for_slack(text, max_length=SLACK_RETRY_MAX_MESSAGE_LENGTH)
-            await self._api.update_message(channel, ts, truncated)
+            truncated = _truncate_for_slack(text, max_bytes=SLACK_RETRY_MAX_MESSAGE_BYTES)
+            try:
+                await self._api.update_message(channel, ts, truncated)
+            except RuntimeError as exc_retry:
+                if "msg_too_long" in str(exc_retry):
+                    logger.error("Slack msg_too_long persists for %s:%s after retry; giving up", channel, ts)
+                    return
+                raise
 
     def register_routes(self, app: FastAPI) -> None:
         """No routes needed for Socket Mode (implements ServiceAdapter.register_routes)."""
