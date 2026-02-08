@@ -19,6 +19,18 @@ logger = logging.getLogger(__name__)
 
 # Slack's message limit is ~40k characters; use a conservative threshold.
 SLACK_MAX_MESSAGE_LENGTH = 39_000
+SLACK_TRUNCATION_NOTICE = "\n\n_(message truncated — too long for Slack)_"
+
+
+def _truncate_for_slack(text: str) -> str:
+    if len(text) <= SLACK_MAX_MESSAGE_LENGTH:
+        return text
+
+    max_len = SLACK_MAX_MESSAGE_LENGTH - len(SLACK_TRUNCATION_NOTICE)
+    if max_len <= 0:
+        return SLACK_TRUNCATION_NOTICE[:SLACK_MAX_MESSAGE_LENGTH]
+
+    return text[:max_len] + SLACK_TRUNCATION_NOTICE
 
 
 class SlackAdapter:
@@ -484,11 +496,7 @@ class SlackAdapter:
             final_text += f"\n\n<{session_url}|View full session>"
 
         # Slack has a ~40k character limit; truncate if needed
-        if len(final_text) > SLACK_MAX_MESSAGE_LENGTH:
-            final_text = (
-                final_text[:SLACK_MAX_MESSAGE_LENGTH]
-                + "\n\n_(message truncated — too long for Slack)_"
-            )
+        final_text = _truncate_for_slack(final_text)
 
         try:
             channel = session_data["channel"]
