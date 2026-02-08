@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     slack_bot_token: str = ""  # Bot token (xoxb-...) for Web API
     slack_user_token: str = ""  # User token (xoxp-...) for search API
     slack_channel_repos: str = ""  # JSON: {"C123": "owner/repo", "C456": "owner/repo2"}
+    slack_channel_prompts: str = ""  # JSON: {"C123": "You are debugging alerts.", ...}
 
     # GitHub
     github_app_id: str = ""
@@ -113,6 +114,19 @@ class Settings(BaseSettings):
             return {}
         try:
             mapping = json.loads(self.slack_channel_repos)
+            if not isinstance(mapping, dict):
+                return {}
+            return {str(k): str(v) for k, v in mapping.items()}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    @property
+    def parsed_slack_channel_prompts(self) -> dict[str, str]:
+        """Parse SLACK_CHANNEL_PROMPTS JSON into a channel_id -> prompt mapping."""
+        if not self.slack_channel_prompts:
+            return {}
+        try:
+            mapping = json.loads(self.slack_channel_prompts)
             if not isinstance(mapping, dict):
                 return {}
             return {str(k): str(v) for k, v in mapping.items()}
