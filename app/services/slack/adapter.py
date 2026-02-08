@@ -18,7 +18,7 @@ from app.services.slack.socket_client import SlackSocketClient
 logger = logging.getLogger(__name__)
 
 # Slack's message limit is ~40k characters; use a conservative threshold.
-SLACK_MAX_MESSAGE_LENGTH = 39_000
+SLACK_MAX_MESSAGE_LENGTH = 30_000
 SLACK_TRUNCATION_NOTICE = "\n\n_(message truncated — too long for Slack)_"
 
 
