@@ -139,7 +139,7 @@ class RepoProvider:
             repo_path = self._repo_path
             assert repo_path is not None
 
-            if cwd and Path(cwd).exists() and Path(cwd) != repo_path:
+            if cwd and Path(cwd).exists() and Path(cwd).resolve() != repo_path.resolve():
                 # Worktree already exists — just fetch to update remote refs
                 worktree_path = cwd
             else:
