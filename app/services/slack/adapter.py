@@ -451,12 +451,13 @@ class SlackAdapter:
         except Exception:
             logger.exception("Error sending update to Slack for %s", session_id)
 
-    async def send_completion(self, session_id: str, message: str) -> None:
+    async def send_completion(self, session_id: str, message: str, session_url: str = "") -> None:
         """Send completion message (implements ServiceAdapter.send_completion).
 
         Args:
             session_id: External session ID
             message: Completion message
+            session_url: Optional link to the session viewer
         """
         # Keep session data for thread continuations (don't pop)
         session_data = self._sessions.get(session_id)
@@ -466,6 +467,10 @@ class SlackAdapter:
 
         # Use accumulated message if available, otherwise use provided message
         final_text = self._message_buffers.pop(session_id, "") or message
+
+        # Append session viewer link if available
+        if session_url:
+            final_text += f"\n\n<{session_url}|View full session>"
 
         # Slack has a ~40k character limit; truncate if needed
         if len(final_text) > SLACK_MAX_MESSAGE_LENGTH:

@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     acp_agent_command: str = "claude-code-acp"  # Legacy single-agent config
     enabled_services: str = "linear"  # comma-separated: "linear" or "linear,slack"
+    bridge_base_url: str = ""  # e.g. "https://bridge.example.com" — for session viewer links
 
     # Multi-agent registry (JSON string)
     # e.g. '{"claude": {"command": "claude-code-acp", "default": true}, "codex": {"command": "codex-acp"}}'

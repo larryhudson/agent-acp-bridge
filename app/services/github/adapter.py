@@ -609,7 +609,7 @@ class GitHubAdapter:
         except Exception:
             logger.exception("Error sending update to GitHub for %s", session_id)
 
-    async def send_completion(self, session_id: str, message: str) -> None:
+    async def send_completion(self, session_id: str, message: str, session_url: str = "") -> None:
         """Send completion: final edit + rocket reaction."""
         session_data = self._sessions.get(session_id)
         if not session_data:
@@ -617,6 +617,10 @@ class GitHubAdapter:
             return
 
         final_text = self._message_buffers.pop(session_id, "") or message
+
+        # Append session viewer link if available
+        if session_url:
+            final_text += f"\n\n[View full session]({session_url})"
 
         try:
             owner = session_data["owner"]
