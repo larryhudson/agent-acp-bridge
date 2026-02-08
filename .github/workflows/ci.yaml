@@ -25,15 +25,12 @@ jobs:
 
       - name: Lint with ruff
         run: uv run ruff check .
-        continue-on-error: true
 
       - name: Format check with ruff
         run: uv run ruff format --check .
-        continue-on-error: true
 
       - name: Type check with ty
         run: uv run ty check .
-        continue-on-error: true
 
   # Uncomment to use pre-commit for additional checks
   # pre-commit:
