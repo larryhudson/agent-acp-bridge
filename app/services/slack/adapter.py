@@ -337,16 +337,16 @@ class SlackAdapter:
         channel_repos = settings.parsed_slack_channel_repos
         channel_repo = channel_repos.get(mention_event.channel, "")
 
-        # Prepend channel-specific context to the prompt if configured
+        # Use channel-specific context as system prompt if configured
         channel_prompts = settings.parsed_slack_channel_prompts
         channel_context = channel_prompts.get(mention_event.channel, "")
-        full_prompt = f"{channel_context}\n\n{prompt}" if channel_context else prompt
 
         # Create bridge request
         request = BridgeSessionRequest(
             external_session_id=session_id,
             service_name=self.service_name,
-            prompt=thread_context + full_prompt,
+            prompt=thread_context + prompt,
+            system_prompt=channel_context,
             agent_name=self._agent_name,
             descriptive_name=slugify(prompt[:60]),
             service_metadata=session_data,

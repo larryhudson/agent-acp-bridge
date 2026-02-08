@@ -39,6 +39,7 @@ class ActiveSession:
     service_metadata: dict[str, Any] | None = None  # Adapter-specific state
     github_repo: str = ""  # Repo used for this session (for follow-ups)
     github_installation_id: int = 0  # Installation ID used (for follow-ups)
+    system_prompt: str = ""  # Instruction-level context for the agent
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize session metadata to dict (excluding runtime objects)."""
@@ -54,6 +55,8 @@ class ActiveSession:
         }
         if self.service_metadata:
             data["service_metadata"] = self.service_metadata
+        if self.system_prompt:
+            data["system_prompt"] = self.system_prompt
         return data
 
     @classmethod
@@ -72,6 +75,7 @@ class ActiveSession:
             service_metadata=data.get("service_metadata"),
             github_repo=data.get("github_repo", ""),
             github_installation_id=data.get("github_installation_id", 0),
+            system_prompt=data.get("system_prompt", ""),
         )
 
 
@@ -241,7 +245,7 @@ class SessionManager:
         session_url = self._build_session_url(acp_session_id)
 
         try:
-            stop_reason = await acp_session.prompt(prompt)
+            stop_reason = await acp_session.prompt(prompt, system_prompt=request.system_prompt)
             # Flush any remaining buffered updates
             await router.flush()
 
@@ -352,7 +356,7 @@ class SessionManager:
         session_url = self._build_session_url(active.acp_session_id)
 
         try:
-            stop_reason = await acp_session.prompt(prompt)
+            stop_reason = await acp_session.prompt(prompt, system_prompt=active.system_prompt)
             await router.flush()
 
             if stop_reason == "end_turn":
@@ -421,6 +425,7 @@ class SessionManager:
                     ),  # Restore adapter-specific state
                     github_repo=metadata.get("github_repo", ""),
                     github_installation_id=metadata.get("github_installation_id", 0),
+                    system_prompt=metadata.get("system_prompt", ""),
                 )
                 restored_count += 1
 
