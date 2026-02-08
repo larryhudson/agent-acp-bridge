@@ -279,7 +279,7 @@ class SlackAdapter:
         # Mark this thread as active (will persist after session ends)
         self._active_threads.add((mention_event.channel, thread_ts))
 
-        # Resolve which repo this channel should use
+        # Resolve which repo this channel should use (uses global installation ID for auth)
         channel_repos = settings.parsed_slack_channel_repos
         channel_repo = channel_repos.get(mention_event.channel, "")
 

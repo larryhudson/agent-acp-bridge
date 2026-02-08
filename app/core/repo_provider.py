@@ -306,6 +306,9 @@ class RepoProvider:
             logger.warning("No github_repo specified — skipping repo setup")
             return
 
+        if github_repo.count("/") != 1:
+            raise ValueError(f"Invalid repo format {github_repo!r} — expected 'owner/repo'")
+
         repo_path = self._repo_path(github_repo)
 
         if repo_path.exists():
