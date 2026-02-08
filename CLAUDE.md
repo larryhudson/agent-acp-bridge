@@ -53,6 +53,10 @@ Config is loaded from `.env` via Pydantic Settings (see `app/config.py`). Projec
 - Or prefix commands with the venv Python: `.venv/bin/python`
 - The PATH may not include uv by default - use `$HOME/.local/bin/uv` if needed
 
+## Pull Requests
+
+Keep PR descriptions short — a couple of sentences max. Don't repeat the diff in prose.
+
 ## Package Management
 
 - Use **uv** for Python package management

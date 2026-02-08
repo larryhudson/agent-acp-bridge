@@ -279,10 +279,10 @@ class SlackAdapter:
         # Mark this thread as active (will persist after session ends)
         self._active_threads.add((mention_event.channel, thread_ts))
 
-        # Create bridge request (service_name stays "slack" for project mapping)
+        # Create bridge request
         request = BridgeSessionRequest(
             external_session_id=session_id,
-            service_name="slack",
+            service_name=self.service_name,
             prompt=thread_context + prompt,
             agent_name=self._agent_name,
             descriptive_name=slugify(prompt[:60]),
