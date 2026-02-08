@@ -259,8 +259,10 @@ class RepoProvider:
                 if not repo_path.exists():
                     # Repo was deleted but worktrees remain — clean them up
                     logger.info("Removing worktrees for deleted repo: %s", repo_dir.name)
+                    # Count directories before deleting
+                    count = sum(1 for _ in repo_dir.iterdir() if _.is_dir())
                     shutil.rmtree(repo_dir, ignore_errors=True)
-                    cleaned_count += sum(1 for _ in repo_dir.iterdir() if _.is_dir())
+                    cleaned_count += count
                     continue
 
                 # Check each worktree directory
