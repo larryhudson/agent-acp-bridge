@@ -37,6 +37,8 @@ class ActiveSession:
     branch_name: str = ""  # Git branch for this session
     agent_name: str = ""  # Which agent is running this session
     service_metadata: dict[str, Any] | None = None  # Adapter-specific state
+    github_repo: str = ""  # Repo used for this session (for follow-ups)
+    github_installation_id: int = 0  # Installation ID used (for follow-ups)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize session metadata to dict (excluding runtime objects)."""
@@ -47,6 +49,8 @@ class ActiveSession:
             "cwd": self.cwd,
             "branch_name": self.branch_name,
             "agent_name": self.agent_name,
+            "github_repo": self.github_repo,
+            "github_installation_id": self.github_installation_id,
         }
         if self.service_metadata:
             data["service_metadata"] = self.service_metadata
@@ -66,6 +70,8 @@ class ActiveSession:
             branch_name=data.get("branch_name", ""),
             agent_name=data.get("agent_name", ""),
             service_metadata=data.get("service_metadata"),
+            github_repo=data.get("github_repo", ""),
+            github_installation_id=data.get("github_installation_id", 0),
         )
 
 
@@ -173,7 +179,10 @@ class SessionManager:
         # Prepare the repo: clone/fetch, create branch, install skill files
         try:
             repo_session = await self._repo_provider.prepare_new_session(
-                request.descriptive_name, agent_name=agent_name
+                request.descriptive_name,
+                agent_name=agent_name,
+                github_repo=request.github_repo,
+                github_installation_id=request.github_installation_id,
             )
         except Exception:
             logger.exception("Failed to prepare repo for %s", external_id)
@@ -207,6 +216,8 @@ class SessionManager:
             branch_name=repo_session.branch_name,
             agent_name=agent_name,
             service_metadata=request.service_metadata,
+            github_repo=request.github_repo,
+            github_installation_id=request.github_installation_id,
         )
         self._active_sessions[external_id] = active
         self._save_sessions()  # Persist to disk
@@ -283,21 +294,31 @@ class SessionManager:
         if active.branch_name:
             try:
                 repo_session = await self._repo_provider.prepare_resume_session(
-                    active.branch_name, cwd=active.cwd, agent_name=agent_name
+                    active.branch_name,
+                    cwd=active.cwd,
+                    agent_name=agent_name,
+                    github_repo=active.github_repo,
+                    github_installation_id=active.github_installation_id,
                 )
                 env = repo_session.env or None
             except Exception:
                 logger.exception("Failed to prepare repo for follow-up %s", external_session_id)
                 # Fall back to just refreshing tokens
                 try:
-                    fresh_env = await self._repo_provider.build_agent_env(agent_name)
+                    fresh_env = await self._repo_provider.build_agent_env(
+                        agent_name=agent_name,
+                        installation_id=active.github_installation_id,
+                    )
                     env = fresh_env or None
                 except Exception:
                     logger.exception("Failed to build agent env for %s", external_session_id)
         else:
             # No branch (legacy session) — just refresh tokens
             try:
-                fresh_env = await self._repo_provider.build_agent_env(agent_name)
+                fresh_env = await self._repo_provider.build_agent_env(
+                    agent_name=agent_name,
+                    installation_id=active.github_installation_id,
+                )
                 env = fresh_env or None
             except Exception:
                 logger.exception("Failed to build agent env for %s", external_session_id)
@@ -398,6 +419,8 @@ class SessionManager:
                     service_metadata=metadata.get(
                         "service_metadata"
                     ),  # Restore adapter-specific state
+                    github_repo=metadata.get("github_repo", ""),
+                    github_installation_id=metadata.get("github_installation_id", 0),
                 )
                 restored_count += 1
 
@@ -420,7 +443,9 @@ class SessionManager:
         """Remove a session from tracking, clean up its worktree, and persist."""
         active = self._active_sessions.get(external_session_id)
         if active is not None:
-            await self._repo_provider.cleanup_worktree(active.cwd, branch_name=active.branch_name)
+            await self._repo_provider.cleanup_worktree(
+                active.cwd, branch_name=active.branch_name, github_repo=active.github_repo
+            )
             del self._active_sessions[external_session_id]
             self._save_sessions()
             logger.info("Removed session %s from tracking", external_session_id)

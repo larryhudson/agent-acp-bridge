@@ -279,6 +279,10 @@ class SlackAdapter:
         # Mark this thread as active (will persist after session ends)
         self._active_threads.add((mention_event.channel, thread_ts))
 
+        # Resolve which repo this channel should use (uses global installation ID for auth)
+        channel_repos = settings.parsed_slack_channel_repos
+        channel_repo = channel_repos.get(mention_event.channel, "")
+
         # Create bridge request
         request = BridgeSessionRequest(
             external_session_id=session_id,
@@ -287,6 +291,7 @@ class SlackAdapter:
             agent_name=self._agent_name,
             descriptive_name=slugify(prompt[:60]),
             service_metadata=session_data,
+            github_repo=channel_repo,
         )
 
         # Start agent session

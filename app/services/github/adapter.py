@@ -318,6 +318,8 @@ class GitHubAdapter:
             agent_name=self._agent_name,
             descriptive_name=slugify(issue.title),
             service_metadata=session_data,
+            github_repo=repo.full_name,
+            github_installation_id=installation_id,
         )
 
         await self._session_manager.handle_new_session(self, request)
@@ -429,6 +431,8 @@ class GitHubAdapter:
             agent_name=self._agent_name,
             descriptive_name=slugify(issue.title),
             service_metadata=session_data,
+            github_repo=repo.full_name,
+            github_installation_id=installation_id,
         )
 
         await self._session_manager.handle_new_session(self, request)
@@ -551,6 +555,8 @@ class GitHubAdapter:
             agent_name=self._agent_name,
             descriptive_name=slugify(pr.title),
             service_metadata=session_data,
+            github_repo=repo.full_name,
+            github_installation_id=installation_id,
         )
 
         await self._session_manager.handle_new_session(self, request)

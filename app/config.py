@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # e.g. '{"claude": {"command": "claude-code-acp", "default": true}, "codex": {"command": "codex-acp"}}'
     agents_json: str = ""
 
-    # Shared repo config
+    # Default repo config (used when no per-channel mapping exists)
     github_repo: str = ""  # e.g. "owner/repo"
     github_installation_id: int = 0  # GitHub App installation ID for non-webhook sessions
 
@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     slack_app_token: str = ""  # App-level token (xapp-...) for Socket Mode
     slack_bot_token: str = ""  # Bot token (xoxb-...) for Web API
     slack_user_token: str = ""  # User token (xoxp-...) for search API
+    slack_channel_repos: str = ""  # JSON: {"C123": "owner/repo", "C456": "owner/repo2"}
 
     # GitHub
     github_app_id: str = ""
@@ -101,6 +102,22 @@ class Settings(BaseSettings):
 
         # Fall back to base
         return getattr(self, var_name.lower(), "")
+
+    @property
+    def parsed_slack_channel_repos(self) -> dict[str, str]:
+        """Parse SLACK_CHANNEL_REPOS JSON into a channel_id -> repo mapping.
+
+        All repos use the global GITHUB_INSTALLATION_ID for token generation.
+        """
+        if not self.slack_channel_repos:
+            return {}
+        try:
+            mapping = json.loads(self.slack_channel_repos)
+            if not isinstance(mapping, dict):
+                return {}
+            return {str(k): str(v) for k, v in mapping.items()}
+        except (json.JSONDecodeError, TypeError):
+            return {}
 
 
 settings = Settings()

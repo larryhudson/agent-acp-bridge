@@ -17,6 +17,8 @@ class BridgeSessionRequest:
     descriptive_name: str = ""  # Used for branch naming (e.g. issue title)
     is_followup: bool = False  # Whether this continues an existing session
     service_metadata: dict[str, Any] | None = None  # Adapter-specific state to persist
+    github_repo: str = ""  # Override repo (e.g. "owner/repo"); falls back to default
+    github_installation_id: int = 0  # Override installation ID; falls back to default
 
 
 @dataclass
