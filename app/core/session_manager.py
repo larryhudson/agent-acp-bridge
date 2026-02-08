@@ -359,9 +359,10 @@ class SessionManager:
                     continue
 
                 # Create a partial ActiveSession that can be resumed on follow-up
+                # Use the adapter's service_name so get_sessions_for_service() matches
                 self._active_sessions[external_id] = ActiveSession(
                     external_session_id=metadata["external_session_id"],
-                    service_name=metadata["service_name"],
+                    service_name=adapter.service_name,
                     adapter=adapter,
                     acp_session=None,  # Will be created on follow-up
                     update_router=None,  # Will be created on follow-up
