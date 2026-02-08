@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,6 +21,45 @@ logger = logging.getLogger(__name__)
 # Module-level references for access during requests
 _session_manager: SessionManager | None = None
 _adapters: list[ServiceAdapter] = []
+_cleanup_task: asyncio.Task[None] | None = None
+
+
+async def _periodic_cleanup_task(
+    repo_provider: RepoProvider, session_manager: SessionManager
+) -> None:
+    """Background task that periodically cleans up stale worktrees."""
+    if not settings.worktree_cleanup_enabled:
+        logger.info("Worktree cleanup is disabled")
+        return
+
+    interval_seconds = settings.worktree_cleanup_interval_hours * 3600
+    logger.info(
+        "Starting periodic worktree cleanup (threshold: %d days, interval: %d hours)",
+        settings.worktree_cleanup_age_days,
+        settings.worktree_cleanup_interval_hours,
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+
+            # Get active session cwds to avoid cleaning them
+            active_cwds = {
+                session.cwd for session in session_manager._active_sessions.values()
+            }
+
+            logger.debug("Running periodic worktree cleanup...")
+            cleaned = await repo_provider.cleanup_stale_worktrees(
+                age_threshold_days=settings.worktree_cleanup_age_days,
+                active_sessions=active_cwds,
+            )
+            if cleaned > 0:
+                logger.info("Periodic cleanup removed %d stale worktree(s)", cleaned)
+        except asyncio.CancelledError:
+            logger.info("Periodic cleanup task cancelled")
+            break
+        except Exception:
+            logger.exception("Error in periodic cleanup task")
 
 
 def _create_adapters(
@@ -111,7 +151,7 @@ def _create_adapters(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """App lifespan: initialize session manager and adapters, clean up on shutdown."""
-    global _session_manager, _adapters
+    global _session_manager, _adapters, _cleanup_task
 
     logging.basicConfig(
         level=logging.INFO,
@@ -141,6 +181,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _session_manager = SessionManager(repo_provider=repo_provider)
     _adapters = _create_adapters(_session_manager, github_auth_map=github_auth_map)
 
+    # Startup cleanup: remove stale worktrees that aren't in active sessions
+    if settings.worktree_cleanup_enabled:
+        logger.info("Running startup worktree cleanup...")
+        try:
+            cleaned = await repo_provider.cleanup_stale_worktrees(
+                age_threshold_days=settings.worktree_cleanup_age_days,
+                active_sessions=set(),  # No active sessions yet at startup
+            )
+            if cleaned > 0:
+                logger.info("Startup cleanup removed %d stale worktree(s)", cleaned)
+        except Exception:
+            logger.exception("Error during startup worktree cleanup")
+
     # Register routes and start each adapter
     for adapter in _adapters:
         adapter.register_routes(app)
@@ -153,12 +206,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await adapter.start()
         logger.info("Started adapter: %s", adapter.service_name)
 
+    # Start background cleanup task
+    if settings.worktree_cleanup_enabled:
+        _cleanup_task = asyncio.create_task(
+            _periodic_cleanup_task(repo_provider, _session_manager)
+        )
+
     logger.info("ACP Bridge started (services: %s)", settings.enabled_services)
 
     yield
 
     # Shutdown
     logger.info("Shutting down ACP Bridge...")
+
+    # Cancel background cleanup task
+    if _cleanup_task is not None:
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+
     await _session_manager.shutdown()
 
     for adapter in _adapters:
@@ -169,6 +237,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     _session_manager = None
     _adapters = []
+    _cleanup_task = None
 
 
 app = FastAPI(
