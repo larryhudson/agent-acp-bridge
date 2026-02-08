@@ -13,6 +13,7 @@ class BridgeSessionRequest:
     external_session_id: str  # e.g., Linear agent session ID
     service_name: str  # e.g., "linear", "slack"
     prompt: str  # The user's message / issue context
+    system_prompt: str = ""  # Instruction-level context for the agent
     agent_name: str = ""  # Which agent to use (empty = default)
     descriptive_name: str = ""  # Used for branch naming (e.g. issue title)
     is_followup: bool = False  # Whether this continues an existing session

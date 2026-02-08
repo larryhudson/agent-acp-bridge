@@ -118,7 +118,7 @@ class AcpSession:
 
         return self._session_id
 
-    async def prompt(self, text: str) -> str:
+    async def prompt(self, text: str, system_prompt: str = "") -> str:
         """Send a prompt to the agent and wait for the turn to complete.
 
         Returns the stop reason.
@@ -129,6 +129,7 @@ class AcpSession:
         response = await self._conn.prompt(
             session_id=self._session_id,
             prompt=[text_block(text)],
+            **({"system_prompt": system_prompt} if system_prompt else {}),
         )
         return response.stop_reason
 
